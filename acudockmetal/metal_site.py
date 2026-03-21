@@ -28,6 +28,13 @@ METAL_RESIDUES = {
     "DY", "HO", "ER", "TM", "YB", "LU",
 }
 
+# Element symbols for fallback detection (handles PDBFixer renaming)
+_METAL_SYMBOLS = {
+    "ZN", "FE", "CU", "CO", "NI", "MN", "MG", "CA", "NA", "K",
+    "LA", "CE", "PR", "ND", "SM", "EU", "GD", "TB",
+    "DY", "HO", "ER", "TM", "YB", "LU",
+}
+
 # Map PDB residue names to our library keys
 _RESNAME_TO_SYMBOL = {
     "ZN": "ZN", "FE": "FE", "FE2": "FE", "CU": "CU", "CU1": "CU",
@@ -165,7 +172,7 @@ class MetalSiteDetector:
                         all_atoms.append(ainfo)
                         all_coords.append(coord)
 
-                        if resname in METAL_RESIDUES:
+                        if resname in METAL_RESIDUES or elem in _METAL_SYMBOLS:
                             metal_atoms.append(idx)
 
         if not all_coords:
