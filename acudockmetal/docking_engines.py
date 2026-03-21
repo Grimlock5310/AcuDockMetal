@@ -81,9 +81,9 @@ class VinaEngine:
         """
         from vina import Vina
 
-        if receptor.pdbqt_path is None:
+        if not receptor.pdbqt_path:
             raise RuntimeError("Receptor PDBQT not available.")
-        if ligand.pdbqt_string is None:
+        if not ligand.pdbqt_string or not ligand.pdbqt_string.strip():
             raise RuntimeError("Ligand PDBQT not available.")
 
         v = Vina(sf_name="vina", cpu=self.cpu, seed=self.seed)
@@ -204,7 +204,8 @@ class GninaEngine:
         hypothesis: Optional[CoordinationHypothesis] = None,
     ) -> List[DockingPose]:
         """Run GNINA docking."""
-        if receptor.pdbqt_path is None or ligand.pdbqt_string is None:
+        if not receptor.pdbqt_path or not ligand.pdbqt_string \
+                or not ligand.pdbqt_string.strip():
             raise RuntimeError("PDBQT files required for GNINA.")
 
         with tempfile.TemporaryDirectory(prefix="gnina_") as tmpdir:

@@ -209,13 +209,19 @@ class ReceptorPreparator:
 
         log.info("Re-injecting %d metal ion(s) stripped by PDBFixer",
                  len(original_metals))
+        inserted = False
         with open(fixed_pdb, "w") as f:
             for line in fixed_lines:
                 stripped = line.strip()
                 if stripped in ("END", "ENDMDL"):
                     for m in original_metals:
                         f.write(m if m.endswith("\n") else m + "\n")
+                    inserted = True
                 f.write(line)
+            if not inserted:
+                # No END record found — append metals at end of file
+                for m in original_metals:
+                    f.write(m if m.endswith("\n") else m + "\n")
 
     def _to_pdbqt(self, pdb_path: str, pdbqt_path: str) -> None:
         """Convert PDB to PDBQT for AutoDock Vina."""
@@ -367,6 +373,9 @@ class LigandPreparator:
                 AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
             except Exception:
                 pass  # MMFF may not support metals
+        else:
+            log.warning("Could not generate 3D conformer; "
+                        "PDBQT conversion may fail.")
 
         variants = []
 
@@ -453,6 +462,8 @@ class LigandPreparator:
         )
         if result.returncode != 0:
             raise RuntimeError(f"obabel failed: {result.stderr.strip()}")
+        if not result.stdout.strip():
+            raise RuntimeError("obabel returned empty PDBQT")
         return result.stdout
 
     def summary(self, variants: List[PreparedLigand]) -> str:
