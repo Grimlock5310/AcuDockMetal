@@ -197,11 +197,18 @@ class ReceptorPreparator:
             for line in f:
                 if line.startswith("HETATM"):
                     elem = line[76:78].strip().upper() if len(line) >= 78 else ""
-                    if elem in _METAL_ELEMENTS:
+                    resname = line[17:20].strip().upper()
+                    # Check both element column and residue name
+                    if elem in _METAL_ELEMENTS or resname in _METAL_ELEMENTS:
                         original_metals.append(line)
 
         if not original_metals:
+            log.info("No metal HETATM lines found in original PDB %s",
+                     original_pdb)
             return
+
+        log.info("Found %d metal HETATM line(s) in original PDB",
+                 len(original_metals))
 
         with open(fixed_pdb) as f:
             fixed_lines = f.readlines()
@@ -215,6 +222,7 @@ class ReceptorPreparator:
         )
 
         if metals_present:
+            log.info("Metals already present in fixed PDB — no re-injection needed")
             return
 
         log.info("Re-injecting %d metal ion(s) stripped by PDBFixer",
@@ -324,7 +332,7 @@ class LigandPreparator:
         if mol is None:
             raise ValueError(f"Invalid SMILES: {smiles}")
         mol.SetProp("_Name", name)
-        return self._prepare_mol(mol, name, output_dir)
+        return self._prepare_mol(mol, name, output_dir, original_smiles=smiles)
 
     def prepare_from_sdf(
         self,
@@ -347,6 +355,7 @@ class LigandPreparator:
         mol,
         name: str,
         output_dir: Optional[str],
+        original_smiles: Optional[str] = None,
     ) -> List[PreparedLigand]:
         """Core preparation for a single molecule."""
         from rdkit import Chem
@@ -427,8 +436,11 @@ class LigandPreparator:
                 # If RDKit conformer failed (degenerate PDB), generate 3D
                 # coords and PDBQT directly from SMILES via obabel --gen3d
                 if not pdbqt_str or not pdbqt_str.strip():
+                    # Use original SMILES (not RDKit canonical) — RDKit may
+                    # mangle metal coordination in canonical form
+                    gen3d_smi = original_smiles or smi
                     try:
-                        pdbqt_str = self._smiles_to_pdbqt_obabel(smi)
+                        pdbqt_str = self._smiles_to_pdbqt_obabel(gen3d_smi)
                     except Exception as e2:
                         log.warning(
                             "obabel --gen3d from SMILES also failed for %s: %s",

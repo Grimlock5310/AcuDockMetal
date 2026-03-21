@@ -159,6 +159,12 @@ class MetalSiteDetector:
                     for atom in residue:
                         coord = atom.get_vector().get_array()
                         elem = atom.element.strip().upper() if atom.element else ""
+                        # Fallback: infer element from atom name when
+                        # element column is missing (common with OpenMM output)
+                        if not elem:
+                            aname = atom.get_name().strip().upper()
+                            if aname in _METAL_SYMBOLS:
+                                elem = aname
                         ainfo = AtomInfo(
                             chain_id=chain_id,
                             residue_name=resname,
