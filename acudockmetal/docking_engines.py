@@ -194,7 +194,7 @@ class GninaEngine:
                 capture_output=True, text=True, timeout=10,
             )
             return result.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired):
             return False
 
     def dock(
