@@ -211,7 +211,8 @@ class ReceptorPreparator:
                  len(original_metals))
         with open(fixed_pdb, "w") as f:
             for line in fixed_lines:
-                if line.startswith(("END\n", "END\r", "ENDMDL")):
+                stripped = line.strip()
+                if stripped in ("END", "ENDMDL"):
                     for m in original_metals:
                         f.write(m if m.endswith("\n") else m + "\n")
                 f.write(line)
@@ -226,8 +227,9 @@ class ReceptorPreparator:
         if mk_prep:
             out_dir = os.path.dirname(pdbqt_path) or "."
             basename = os.path.splitext(os.path.basename(pdbqt_path))[0]
+            abs_pdb = os.path.abspath(pdb_path)
             result = subprocess.run(
-                [mk_prep, "--read_pdb", pdb_path,
+                [mk_prep, "--read_pdb", abs_pdb,
                  "-o", basename, "-p", "--allow_bad_res"],
                 capture_output=True, text=True, timeout=300,
                 cwd=out_dir,
