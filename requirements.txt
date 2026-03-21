@@ -1,0 +1,14 @@
+numpy>=1.21
+scipy>=1.7
+rdkit-pypi>=2022.3
+biopython>=1.79
+meeko>=0.5
+vina>=1.2
+pdbfixer>=1.8
+openmm>=7.7
+openbabel-wheel>=3.1
+prody>=2.0
+py3Dmol>=1.8
+matplotlib>=3.5
+seaborn>=0.11
+pandas>=1.3
