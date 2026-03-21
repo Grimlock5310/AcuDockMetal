@@ -197,11 +197,18 @@ class ReceptorPreparator:
             for line in f:
                 if line.startswith("HETATM"):
                     elem = line[76:78].strip().upper() if len(line) >= 78 else ""
-                    if elem in _METAL_ELEMENTS:
+                    resname = line[17:20].strip().upper()
+                    # Check both element column and residue name
+                    if elem in _METAL_ELEMENTS or resname in _METAL_ELEMENTS:
                         original_metals.append(line)
 
         if not original_metals:
+            log.info("No metal HETATM lines found in original PDB %s",
+                     original_pdb)
             return
+
+        log.info("Found %d metal HETATM line(s) in original PDB",
+                 len(original_metals))
 
         with open(fixed_pdb) as f:
             fixed_lines = f.readlines()
@@ -210,11 +217,14 @@ class ReceptorPreparator:
             (line[76:78].strip().upper() if len(line) >= 78 else "")
             in _METAL_ELEMENTS
             or line[17:20].strip().upper() in _METAL_ELEMENTS
+            # Also check atom name field (cols 12-16) for OpenMM-style output
+            or line[12:16].strip().upper() in _METAL_ELEMENTS
             for line in fixed_lines
             if line.startswith("HETATM")
         )
 
         if metals_present:
+            log.info("Metals already present in fixed PDB — no re-injection needed")
             return
 
         log.info("Re-injecting %d metal ion(s) stripped by PDBFixer",
@@ -324,7 +334,7 @@ class LigandPreparator:
         if mol is None:
             raise ValueError(f"Invalid SMILES: {smiles}")
         mol.SetProp("_Name", name)
-        return self._prepare_mol(mol, name, output_dir)
+        return self._prepare_mol(mol, name, output_dir, original_smiles=smiles)
 
     def prepare_from_sdf(
         self,
@@ -347,6 +357,7 @@ class LigandPreparator:
         mol,
         name: str,
         output_dir: Optional[str],
+        original_smiles: Optional[str] = None,
     ) -> List[PreparedLigand]:
         """Core preparation for a single molecule."""
         from rdkit import Chem
@@ -419,16 +430,21 @@ class LigandPreparator:
             pdbqt_str = None
             if has_metal:
                 # Meeko can't handle metals — use obabel directly
+                # Skip Gasteiger charges: they silently drop metal complexes
                 try:
-                    pdbqt_str = self._to_pdbqt_obabel(pdb_path)
+                    pdbqt_str = self._to_pdbqt_obabel(pdb_path,
+                                                       use_gasteiger=False)
                 except Exception as e:
                     log.warning("obabel PDBQT failed for metal ligand %s: %s",
                                 label, e)
                 # If RDKit conformer failed (degenerate PDB), generate 3D
                 # coords and PDBQT directly from SMILES via obabel --gen3d
                 if not pdbqt_str or not pdbqt_str.strip():
+                    # Use original SMILES (not RDKit canonical) — RDKit may
+                    # mangle metal coordination in canonical form
+                    gen3d_smi = original_smiles or smi
                     try:
-                        pdbqt_str = self._smiles_to_pdbqt_obabel(smi)
+                        pdbqt_str = self._smiles_to_pdbqt_obabel(gen3d_smi)
                     except Exception as e2:
                         log.warning(
                             "obabel --gen3d from SMILES also failed for %s: %s",
@@ -471,13 +487,16 @@ class LigandPreparator:
             raise RuntimeError(f"Meeko PDBQT write error: {err}")
         return pdbqt_str
 
-    def _to_pdbqt_obabel(self, pdb_path: str) -> str:
+    def _to_pdbqt_obabel(self, pdb_path: str,
+                          use_gasteiger: bool = True) -> str:
         """Fallback PDBQT conversion using Open Babel."""
         import subprocess
+        cmd = ["obabel", pdb_path, "-O", "-", "-opdbqt"]
+        # Gasteiger charges silently drop metal complexes in obabel 3.x
+        if use_gasteiger:
+            cmd += ["--partialcharge", "gasteiger"]
         result = subprocess.run(
-            ["obabel", pdb_path, "-O", "-", "-opdbqt",
-             "--partialcharge", "gasteiger"],
-            capture_output=True, text=True, timeout=60,
+            cmd, capture_output=True, text=True, timeout=60,
         )
         if result.returncode != 0:
             raise RuntimeError(f"obabel failed: {result.stderr.strip()}")
@@ -490,12 +509,12 @@ class LigandPreparator:
 
         This bypasses RDKit conformer generation entirely, which is
         necessary for metal-containing ligands where RDKit's distance
-        geometry fails.
+        geometry fails. Does NOT use Gasteiger charges — they silently
+        drop metal complexes in Open Babel 3.x.
         """
         import subprocess
         result = subprocess.run(
-            ["obabel", "-ismi", "-opdbqt", "--gen3d",
-             "--partialcharge", "gasteiger"],
+            ["obabel", "-ismi", "-opdbqt", "--gen3d"],
             input=smiles,
             capture_output=True, text=True, timeout=120,
         )
