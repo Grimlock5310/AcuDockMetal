@@ -124,7 +124,16 @@ class ReceptorPreparator:
         metal_sites: List[MetalSite] = []
         if self.detect_metals:
             detector = MetalSiteDetector()
+            # Try detection on fixed structure first
             metal_sites = detector.detect_from_pdb(fixed_path)
+            # Fallback: detect on ORIGINAL PDB (PDBFixer/OpenMM may strip
+            # element columns or rename residues, breaking detection)
+            if not metal_sites and fixed_path != pdb_path:
+                metal_sites = detector.detect_from_pdb(pdb_path)
+                if metal_sites:
+                    notes.append(
+                        "Metal sites detected from original PDB "
+                        "(PDBFixer output lacked proper metal records).")
             notes.append(f"Detected {len(metal_sites)} metal site(s).")
 
         # --- Step 3: Auto-define box ---
@@ -200,6 +209,7 @@ class ReceptorPreparator:
         metals_present = any(
             (line[76:78].strip().upper() if len(line) >= 78 else "")
             in _METAL_ELEMENTS
+            or line[17:20].strip().upper() in _METAL_ELEMENTS
             for line in fixed_lines
             if line.startswith("HETATM")
         )
@@ -414,6 +424,15 @@ class LigandPreparator:
                 except Exception as e:
                     log.warning("obabel PDBQT failed for metal ligand %s: %s",
                                 label, e)
+                # If RDKit conformer failed (degenerate PDB), generate 3D
+                # coords and PDBQT directly from SMILES via obabel --gen3d
+                if not pdbqt_str or not pdbqt_str.strip():
+                    try:
+                        pdbqt_str = self._smiles_to_pdbqt_obabel(smi)
+                    except Exception as e2:
+                        log.warning(
+                            "obabel --gen3d from SMILES also failed for %s: %s",
+                            label, e2)
             else:
                 try:
                     pdbqt_str = self._to_pdbqt_meeko(m)
@@ -464,6 +483,27 @@ class LigandPreparator:
             raise RuntimeError(f"obabel failed: {result.stderr.strip()}")
         if not result.stdout.strip():
             raise RuntimeError("obabel returned empty PDBQT")
+        return result.stdout
+
+    def _smiles_to_pdbqt_obabel(self, smiles: str) -> str:
+        """Generate 3D coords and PDBQT directly from SMILES via obabel.
+
+        This bypasses RDKit conformer generation entirely, which is
+        necessary for metal-containing ligands where RDKit's distance
+        geometry fails.
+        """
+        import subprocess
+        result = subprocess.run(
+            ["obabel", "-ismi", "-opdbqt", "--gen3d",
+             "--partialcharge", "gasteiger"],
+            input=smiles,
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"obabel --gen3d failed: {result.stderr.strip()}")
+        if not result.stdout.strip():
+            raise RuntimeError("obabel --gen3d returned empty PDBQT")
         return result.stdout
 
     def summary(self, variants: List[PreparedLigand]) -> str:
