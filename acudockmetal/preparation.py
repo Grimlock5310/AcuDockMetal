@@ -217,6 +217,8 @@ class ReceptorPreparator:
             (line[76:78].strip().upper() if len(line) >= 78 else "")
             in _METAL_ELEMENTS
             or line[17:20].strip().upper() in _METAL_ELEMENTS
+            # Also check atom name field (cols 12-16) for OpenMM-style output
+            or line[12:16].strip().upper() in _METAL_ELEMENTS
             for line in fixed_lines
             if line.startswith("HETATM")
         )

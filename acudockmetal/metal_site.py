@@ -159,12 +159,12 @@ class MetalSiteDetector:
                     for atom in residue:
                         coord = atom.get_vector().get_array()
                         elem = atom.element.strip().upper() if atom.element else ""
+                        atom_name = atom.get_name().strip().upper()
                         # Fallback: infer element from atom name when
-                        # element column is missing (common with OpenMM output)
-                        if not elem:
-                            aname = atom.get_name().strip().upper()
-                            if aname in _METAL_SYMBOLS:
-                                elem = aname
+                        # element column is missing or BioPython assigns 'X'
+                        # (common with OpenMM output's space-padded atom names)
+                        if (not elem or elem == "X") and atom_name in _METAL_SYMBOLS:
+                            elem = atom_name
                         ainfo = AtomInfo(
                             chain_id=chain_id,
                             residue_name=resname,
@@ -178,7 +178,11 @@ class MetalSiteDetector:
                         all_atoms.append(ainfo)
                         all_coords.append(coord)
 
-                        if resname in METAL_RESIDUES or elem in _METAL_SYMBOLS:
+                        # Check resname, element, AND atom name for metals
+                        # (covers PDBFixer renaming residue to UNK)
+                        if (resname in METAL_RESIDUES
+                                or elem in _METAL_SYMBOLS
+                                or atom_name in _METAL_SYMBOLS):
                             metal_atoms.append(idx)
 
         if not all_coords:
