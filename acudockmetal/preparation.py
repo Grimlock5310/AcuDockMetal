@@ -22,6 +22,13 @@ from acudockmetal.metal_site import MetalSite, MetalSiteDetector
 
 log = logging.getLogger(__name__)
 
+# Elements recognized as metal ions in PDB HETATM records
+_METAL_ELEMENTS = {
+    "ZN", "FE", "CU", "CO", "NI", "MN", "MG", "CA", "NA", "K",
+    "LA", "CE", "PR", "ND", "SM", "EU", "GD", "TB",
+    "DY", "HO", "ER", "TM", "YB", "LU",
+}
+
 
 @dataclass
 class PreparedReceptor:
@@ -171,9 +178,69 @@ class ReceptorPreparator:
         with open(output_path, "w") as f:
             PDBFile.writeFile(fixer.topology, fixer.positions, f)
 
+        # PDBFixer may strip metal ions — re-inject them if missing
+        self._restore_metals(input_path, output_path)
+
+    def _restore_metals(self, original_pdb: str, fixed_pdb: str) -> None:
+        """Re-inject metal HETATM lines if PDBFixer dropped them."""
+        original_metals = []
+        with open(original_pdb) as f:
+            for line in f:
+                if line.startswith("HETATM"):
+                    elem = line[76:78].strip().upper() if len(line) >= 78 else ""
+                    if elem in _METAL_ELEMENTS:
+                        original_metals.append(line)
+
+        if not original_metals:
+            return
+
+        with open(fixed_pdb) as f:
+            fixed_lines = f.readlines()
+
+        metals_present = any(
+            (line[76:78].strip().upper() if len(line) >= 78 else "")
+            in _METAL_ELEMENTS
+            for line in fixed_lines
+            if line.startswith("HETATM")
+        )
+
+        if metals_present:
+            return
+
+        log.info("Re-injecting %d metal ion(s) stripped by PDBFixer",
+                 len(original_metals))
+        with open(fixed_pdb, "w") as f:
+            for line in fixed_lines:
+                if line.startswith(("END\n", "END\r", "ENDMDL")):
+                    for m in original_metals:
+                        f.write(m if m.endswith("\n") else m + "\n")
+                f.write(line)
+
     def _to_pdbqt(self, pdb_path: str, pdbqt_path: str) -> None:
         """Convert PDB to PDBQT for AutoDock Vina."""
+        import shutil
         import subprocess
+
+        # Primary: mk_prepare_receptor.py (installed with meeko)
+        mk_prep = shutil.which("mk_prepare_receptor.py")
+        if mk_prep:
+            out_dir = os.path.dirname(pdbqt_path) or "."
+            basename = os.path.splitext(os.path.basename(pdbqt_path))[0]
+            result = subprocess.run(
+                [mk_prep, "--read_pdb", pdb_path,
+                 "-o", basename, "-p", "--allow_bad_res"],
+                capture_output=True, text=True, timeout=300,
+                cwd=out_dir,
+            )
+            if result.returncode == 0:
+                expected = os.path.join(out_dir, f"{basename}.pdbqt")
+                if os.path.exists(expected) and expected != pdbqt_path:
+                    shutil.move(expected, pdbqt_path)
+                return
+            log.warning("mk_prepare_receptor failed: %s",
+                        result.stderr.strip()[:500])
+
+        # Fallback: obabel
         result = subprocess.run(
             ["obabel", pdb_path, "-O", pdbqt_path,
              "-xr", "--partialcharge", "gasteiger"],
@@ -181,7 +248,8 @@ class ReceptorPreparator:
         )
         if result.returncode != 0:
             raise RuntimeError(
-                f"obabel PDB->PDBQT failed: {result.stderr.strip()}")
+                "PDBQT conversion failed — neither "
+                "mk_prepare_receptor.py nor obabel available")
 
     def _center_of_mass(self, pdb_path: str) -> np.ndarray:
         """Compute center of mass from a PDB file."""
