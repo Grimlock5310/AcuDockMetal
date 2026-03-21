@@ -342,15 +342,31 @@ class LigandPreparator:
 
         mol = Chem.AddHs(mol)
 
+        # Check for metal atoms (affects conformer gen + PDBQT path)
+        has_metal = any(
+            a.GetAtomicNum() > 20
+            or a.GetAtomicNum() in (3, 4, 11, 12, 13, 19, 20)
+            for a in mol.GetAtoms()
+        )
+
         # Generate 3D conformer
         params = AllChem.ETKDGv3()
         params.numThreads = 0
         params.randomSeed = 42
-        result = AllChem.EmbedMolecule(mol, params)
-        if result == -1:
-            # Fallback
-            AllChem.EmbedMolecule(mol, AllChem.ETKDG())
-        AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
+        conf_ok = AllChem.EmbedMolecule(mol, params)
+        if conf_ok == -1:
+            conf_ok = AllChem.EmbedMolecule(mol, AllChem.ETKDG())
+        if conf_ok == -1 and has_metal:
+            # Metals: distance geometry with random coords (no FF needed)
+            params2 = AllChem.ETKDGv3()
+            params2.useRandomCoords = True
+            params2.randomSeed = 42
+            conf_ok = AllChem.EmbedMolecule(mol, params2)
+        if conf_ok != -1:
+            try:
+                AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
+            except Exception:
+                pass  # MMFF may not support metals
 
         variants = []
 
@@ -380,18 +396,26 @@ class LigandPreparator:
             pdb_path = os.path.join(output_dir, f"{name}_{label}.pdb")
             Chem.MolToPDBFile(m, pdb_path)
 
-            # Convert to PDBQT via Meeko
+            # Convert to PDBQT
             pdbqt_str = None
-            try:
-                pdbqt_str = self._to_pdbqt_meeko(m)
-            except Exception as e:
-                log.warning("Meeko PDBQT conversion failed for %s: %s",
-                            label, e)
-                # Fallback: try obabel
+            if has_metal:
+                # Meeko can't handle metals — use obabel directly
                 try:
                     pdbqt_str = self._to_pdbqt_obabel(pdb_path)
-                except Exception as e2:
-                    log.warning("obabel PDBQT fallback failed: %s", e2)
+                except Exception as e:
+                    log.warning("obabel PDBQT failed for metal ligand %s: %s",
+                                label, e)
+            else:
+                try:
+                    pdbqt_str = self._to_pdbqt_meeko(m)
+                except Exception as e:
+                    log.warning("Meeko PDBQT conversion failed for %s: %s",
+                                label, e)
+                    # Fallback: try obabel
+                    try:
+                        pdbqt_str = self._to_pdbqt_obabel(pdb_path)
+                    except Exception as e2:
+                        log.warning("obabel PDBQT fallback failed: %s", e2)
 
             variants.append(PreparedLigand(
                 mol=m,
