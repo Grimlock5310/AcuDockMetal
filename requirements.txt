@@ -6,6 +6,7 @@ meeko>=0.5
 vina>=1.2
 pdbfixer
 openmm
+openbabel-wheel>=3.1
 prody>=2.0
 py3Dmol>=1.8
 matplotlib>=3.5
