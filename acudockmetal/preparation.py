@@ -428,8 +428,10 @@ class LigandPreparator:
             pdbqt_str = None
             if has_metal:
                 # Meeko can't handle metals — use obabel directly
+                # Skip Gasteiger charges: they silently drop metal complexes
                 try:
-                    pdbqt_str = self._to_pdbqt_obabel(pdb_path)
+                    pdbqt_str = self._to_pdbqt_obabel(pdb_path,
+                                                       use_gasteiger=False)
                 except Exception as e:
                     log.warning("obabel PDBQT failed for metal ligand %s: %s",
                                 label, e)
@@ -483,13 +485,16 @@ class LigandPreparator:
             raise RuntimeError(f"Meeko PDBQT write error: {err}")
         return pdbqt_str
 
-    def _to_pdbqt_obabel(self, pdb_path: str) -> str:
+    def _to_pdbqt_obabel(self, pdb_path: str,
+                          use_gasteiger: bool = True) -> str:
         """Fallback PDBQT conversion using Open Babel."""
         import subprocess
+        cmd = ["obabel", pdb_path, "-O", "-", "-opdbqt"]
+        # Gasteiger charges silently drop metal complexes in obabel 3.x
+        if use_gasteiger:
+            cmd += ["--partialcharge", "gasteiger"]
         result = subprocess.run(
-            ["obabel", pdb_path, "-O", "-", "-opdbqt",
-             "--partialcharge", "gasteiger"],
-            capture_output=True, text=True, timeout=60,
+            cmd, capture_output=True, text=True, timeout=60,
         )
         if result.returncode != 0:
             raise RuntimeError(f"obabel failed: {result.stderr.strip()}")
@@ -502,12 +507,12 @@ class LigandPreparator:
 
         This bypasses RDKit conformer generation entirely, which is
         necessary for metal-containing ligands where RDKit's distance
-        geometry fails.
+        geometry fails. Does NOT use Gasteiger charges — they silently
+        drop metal complexes in Open Babel 3.x.
         """
         import subprocess
         result = subprocess.run(
-            ["obabel", "-ismi", "-opdbqt", "--gen3d",
-             "--partialcharge", "gasteiger"],
+            ["obabel", "-ismi", "-opdbqt", "--gen3d"],
             input=smiles,
             capture_output=True, text=True, timeout=120,
         )
