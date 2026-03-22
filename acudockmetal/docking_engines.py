@@ -342,11 +342,23 @@ class GninaEngine:
         stdout: str,
     ) -> List[DockingPose]:
         """Update CNN scores from GNINA stdout."""
-        # Parse CNN scores from output
+        import re
+        # GNINA --score_only prints lines like:
+        #   Affinity: -7.5 (kcal/mol)
+        #   CNNscore: 0.85
+        #   CNNaffinity: 6.2
+        pose_idx = 0
         for line in stdout.splitlines():
-            if "CNNscore" in line or "CNNaffinity" in line:
-                # GNINA prints structured output; parse what we can
-                pass
+            line = line.strip()
+            m_cnn = re.match(r"CNNscore:\s+([\d.eE+-]+)", line)
+            if m_cnn and pose_idx < len(poses):
+                poses[pose_idx].gnina_cnn_score = float(m_cnn.group(1))
+
+            m_aff = re.match(r"CNNaffinity:\s+([\d.eE+-]+)", line)
+            if m_aff and pose_idx < len(poses):
+                poses[pose_idx].gnina_cnn_affinity = float(m_aff.group(1))
+                pose_idx += 1  # CNNaffinity is printed last per pose
+
         return poses
 
 
@@ -418,8 +430,25 @@ class DockingOrchestrator:
 
         return all_poses
 
+    @staticmethod
+    def _kabsch_rmsd(coords_a: np.ndarray, coords_b: np.ndarray) -> float:
+        """Compute RMSD after optimal superposition (Kabsch algorithm)."""
+        centroid_a = coords_a.mean(axis=0)
+        centroid_b = coords_b.mean(axis=0)
+        a_centered = coords_a - centroid_a
+        b_centered = coords_b - centroid_b
+
+        H = a_centered.T @ b_centered
+        U, S, Vt = np.linalg.svd(H)
+        d = np.linalg.det(Vt.T @ U.T)
+        sign_matrix = np.diag([1.0, 1.0, np.sign(d)])
+        R = Vt.T @ sign_matrix @ U.T
+
+        a_rotated = a_centered @ R.T
+        return float(np.sqrt(np.mean((a_rotated - b_centered) ** 2)))
+
     def _cluster_poses(self, poses: List[DockingPose]) -> List[DockingPose]:
-        """Simple greedy RMSD-based clustering."""
+        """Greedy RMSD-based clustering with Kabsch alignment."""
         if len(poses) < 2:
             for p in poses:
                 p.cluster_id = 0
@@ -437,8 +466,7 @@ class DockingOrchestrator:
             assigned = False
             for ci, rep_coords in enumerate(representatives):
                 if rep_coords.shape == pose.coordinates.shape:
-                    rmsd = np.sqrt(np.mean(
-                        (rep_coords - pose.coordinates) ** 2))
+                    rmsd = self._kabsch_rmsd(rep_coords, pose.coordinates)
                     if rmsd < self.cluster_rmsd:
                         pose.cluster_id = ci
                         assigned = True
@@ -448,6 +476,101 @@ class DockingOrchestrator:
                 pose.cluster_id = cluster_id
                 representatives.append(pose.coordinates.copy())
                 cluster_id += 1
+
+        return poses
+
+    def refine_coordination(
+        self,
+        poses: List[DockingPose],
+        hypotheses: List[CoordinationHypothesis],
+        ligand_elements: List[str],
+        top_n: int = 20,
+    ) -> List[DockingPose]:
+        """
+        Post-docking coordination refinement for top poses.
+
+        For each top pose, optimize ligand donor positions to improve
+        metal-donor distances and angles using constrained minimization.
+        Inspired by GOLD's coordination constraint fitting.
+
+        Args:
+            poses: docked poses sorted by score.
+            hypotheses: coordination hypotheses.
+            ligand_elements: element symbols for ligand atoms.
+            top_n: number of top poses to refine.
+
+        Returns:
+            Updated poses with refined coordinates.
+        """
+        from scipy.optimize import minimize as scipy_minimize
+
+        donor_element_set = {"N", "O", "S", "CL"}
+        from acudockmetal.metal_params import MetalParameterLibrary
+        metal_lib = MetalParameterLibrary()
+
+        for pose in poses[:top_n]:
+            if pose.coordinates.size == 0:
+                continue
+
+            hyp = None
+            for h in hypotheses:
+                if h.hypothesis_id == pose.hypothesis_id:
+                    hyp = h
+                    break
+            if hyp is None:
+                continue
+
+            metal_coord = hyp.metal_site.coord
+            mp = metal_lib.get(hyp.metal_symbol)
+            if mp is None:
+                continue
+
+            # Identify donor atoms in this pose
+            donor_indices = []
+            for i, (c, e) in enumerate(zip(pose.coordinates, ligand_elements)):
+                if e.upper() in donor_element_set:
+                    d = np.linalg.norm(c - metal_coord)
+                    if d < 4.0:  # wider cutoff for refinement
+                        donor_indices.append(i)
+
+            if not donor_indices:
+                continue
+
+            # Optimize donor positions to minimize coordination penalty
+            original_coords = pose.coordinates.copy()
+            donor_coords_flat = original_coords[donor_indices].flatten()
+
+            def objective(x):
+                coords = x.reshape(-1, 3)
+                total = 0.0
+                for j, di in enumerate(donor_indices):
+                    elem = ligand_elements[di].upper()
+                    d = np.linalg.norm(coords[j] - metal_coord)
+                    d_ideal = mp.get_ideal_distance(elem)
+                    total += 5.0 * (d - d_ideal) ** 2
+
+                    # Displacement penalty to prevent large moves
+                    disp = np.linalg.norm(coords[j] - original_coords[di])
+                    total += 2.0 * disp ** 2
+                return total
+
+            result = scipy_minimize(
+                objective, donor_coords_flat,
+                method="L-BFGS-B",
+                options={"maxiter": 50, "ftol": 1e-6},
+            )
+
+            if result.success:
+                refined = result.x.reshape(-1, 3)
+                new_coords = original_coords.copy()
+                for j, di in enumerate(donor_indices):
+                    # Limit displacement to 0.5 A
+                    delta = refined[j] - original_coords[di]
+                    norm = np.linalg.norm(delta)
+                    if norm > 0.5:
+                        delta = delta * 0.5 / norm
+                    new_coords[di] = original_coords[di] + delta
+                pose.coordinates = new_coords
 
         return poses
 

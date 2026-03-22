@@ -39,6 +39,7 @@ _METAL_SYMBOLS = {
 _RESNAME_TO_SYMBOL = {
     "ZN": "ZN", "FE": "FE", "FE2": "FE", "CU": "CU", "CU1": "CU",
     "CO": "CO", "NI": "NI", "MN": "MN", "MG": "MG", "CA": "CA",
+    "NA": "NA", "K": "K",
     # Lanthanides all map to generic "LN"
     "LA": "LN", "CE": "LN", "PR": "LN", "ND": "LN", "SM": "LN",
     "EU": "LN", "GD": "LN", "TB": "LN", "DY": "LN", "HO": "LN",

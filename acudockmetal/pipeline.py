@@ -293,25 +293,51 @@ class AcuDockMetalPipeline:
         # --- Step 4: Baseline docking ---
         t0 = time.time()
         log.info("Step 4: Baseline docking...")
-        ligand = ligands[0]  # primary variant
 
-        if all_hypotheses:
-            poses = self.orchestrator.dock_all_hypotheses(
-                receptor, ligand, all_hypotheses)
-        else:
-            # Fall back to standard docking
-            try:
-                poses = self.vina.dock(receptor, ligand)
-            except Exception as e:
-                log.error("Docking failed: %s", e)
-                poses = []
+        all_poses: List[DockingPose] = []
+        for li, ligand_variant in enumerate(ligands):
+            if not ligand_variant.pdbqt_string:
+                log.warning("  Ligand variant %d has no PDBQT; skipping.", li)
+                continue
+            log.info("  Docking ligand variant %d/%d", li + 1, len(ligands))
+            if all_hypotheses:
+                variant_poses = self.orchestrator.dock_all_hypotheses(
+                    receptor, ligand_variant, all_hypotheses)
+            else:
+                try:
+                    variant_poses = self.vina.dock(receptor, ligand_variant)
+                except Exception as e:
+                    log.error("Docking failed for variant %d: %s", li, e)
+                    variant_poses = []
+            # Offset pose IDs to avoid collisions across variants
+            for p in variant_poses:
+                p.pose_id += len(all_poses)
+            all_poses.extend(variant_poses)
 
+        poses = all_poses
+        # Use first variant with a valid mol for element extraction
+        ligand = ligands[0]
         result.docking_poses = poses
-        log.info("  Generated %d poses", len(poses))
+        log.info("  Generated %d poses across %d variant(s)",
+                 len(poses), len(ligands))
         result.timing["docking"] = time.time() - t0
 
         if not poses:
             return result
+
+        # --- Step 4b: Post-docking coordination refinement ---
+        if all_hypotheses and poses:
+            t0_refine = time.time()
+            log.info("Step 4b: Coordination refinement...")
+            elements = self._get_elements(ligand)
+            if elements:
+                try:
+                    poses = self.orchestrator.refine_coordination(
+                        poses, all_hypotheses, elements)
+                    log.info("  Refined top %d poses", min(20, len(poses)))
+                except Exception as e:
+                    log.warning("  Coordination refinement failed: %s", e)
+            result.timing["coord_refinement"] = time.time() - t0_refine
 
         # --- Step 5: Metal-aware scoring ---
         t0 = time.time()
@@ -336,6 +362,7 @@ class AcuDockMetalPipeline:
         # --- Step 6: Geometry validation ---
         t0 = time.time()
         log.info("Step 6: Geometry validation...")
+        receptor_coords = self._get_receptor_coords(receptor)
         if all_hypotheses:
             for pose in poses[:50]:  # validate top 50
                 hyp = self._get_hypothesis(
@@ -344,7 +371,8 @@ class AcuDockMetalPipeline:
                     continue
                 elements = self._get_elements(ligand)
                 val = self.validator.validate(
-                    pose.coordinates, elements, hyp)
+                    pose.coordinates, elements, hyp,
+                    receptor_coords=receptor_coords)
                 val.pose_id = pose.pose_id
                 result.validations.append(val)
         result.timing["validation"] = time.time() - t0
@@ -392,6 +420,24 @@ class AcuDockMetalPipeline:
             if h.hypothesis_id == hyp_id:
                 return h
         return hypotheses[0] if hypotheses else None
+
+    def _get_receptor_coords(self, receptor: PreparedReceptor) -> Optional[np.ndarray]:
+        """Extract heavy-atom coordinates from receptor PDB for clash checking."""
+        try:
+            from Bio.PDB import PDBParser
+            parser = PDBParser(QUIET=True)
+            structure = parser.get_structure("rec", receptor.pdb_path)
+            coords = []
+            for model in structure:
+                for chain in model:
+                    for residue in chain:
+                        for atom in residue:
+                            elem = atom.element.strip().upper() if atom.element else ""
+                            if elem != "H":
+                                coords.append(atom.get_vector().get_array())
+            return np.array(coords) if coords else None
+        except Exception:
+            return None
 
     def _get_elements(self, ligand: PreparedLigand) -> List[str]:
         """Extract element symbols from a prepared ligand."""

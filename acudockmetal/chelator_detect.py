@@ -238,13 +238,16 @@ class ChelatingGroupDetector:
                     continue
                 seen_donor_sets.add(donor_key)
 
-                # Verify donor element symbols
+                # Verify donor element symbols match expected
                 donor_elems = []
                 valid = True
-                for idx in donor_idx:
+                expected_elems = info["donor_elements"]
+                for k, idx in enumerate(donor_idx):
                     atom = mol.GetAtomWithIdx(idx)
                     elem = atom.GetSymbol()
                     donor_elems.append(elem)
+                    if k < len(expected_elems) and elem != expected_elems[k]:
+                        valid = False
 
                 if not valid:
                     continue
