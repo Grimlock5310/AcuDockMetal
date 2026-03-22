@@ -46,11 +46,199 @@ class DockingPose:
                 f"vina={self.vina_score:.1f})")
 
 
+def compute_vacant_coordination_sites(
+    hypothesis: CoordinationHypothesis,
+) -> List[np.ndarray]:
+    """
+    Compute ideal coordination positions for vacant sites around a metal.
+
+    Inspired by MetalDock/AutoDock4Zn: places dummy atoms at positions
+    where the coordination sphere has vacancies.  These positions are
+    computed from the coordination geometry template by finding ideal
+    directions that are not occupied by protein donors.
+
+    Args:
+        hypothesis: coordination hypothesis with metal site info.
+
+    Returns:
+        List of 3D coordinates for vacant coordination positions.
+    """
+    from acudockmetal.metal_params import GEOMETRY_TEMPLATES, MetalParameterLibrary
+
+    metal_coord = hypothesis.metal_site.coord
+    metal_lib = MetalParameterLibrary()
+    mp = metal_lib.get(hypothesis.metal_symbol)
+    if mp is None:
+        return []
+
+    # Get ideal bond length for placing dummy atoms
+    d_ideal = mp.get_ideal_distance("N")  # use N distance as reference
+
+    # Get existing donor directions (normalized)
+    protein_donors = hypothesis.protein_donors
+    occupied_dirs = []
+    for donor in protein_donors:
+        v = donor.coord - metal_coord
+        norm = np.linalg.norm(v)
+        if norm > 0.1:
+            occupied_dirs.append(v / norm)
+
+    # Generate ideal coordination directions from geometry template
+    template = GEOMETRY_TEMPLATES.get(hypothesis.geometry)
+    if template is None:
+        return []
+
+    cn = hypothesis.coordination_number
+    ideal_dirs = _generate_ideal_directions(cn, hypothesis.geometry)
+
+    # Find ideal directions not covered by existing donors
+    # A direction is "covered" if angle to a protein donor < 30 degrees
+    vacant_positions = []
+    for ideal_dir in ideal_dirs:
+        is_occupied = False
+        for occ in occupied_dirs:
+            cos_angle = np.dot(ideal_dir, occ)
+            if cos_angle > 0.866:  # cos(30 deg)
+                is_occupied = True
+                break
+        if not is_occupied:
+            pos = metal_coord + d_ideal * ideal_dir
+            vacant_positions.append(pos)
+
+    # Limit to open_slots
+    return vacant_positions[:hypothesis.open_slots]
+
+
+def _generate_ideal_directions(cn: int, geometry: str) -> List[np.ndarray]:
+    """Generate unit vectors for ideal coordination positions."""
+    if geometry == "tetrahedral":
+        # Regular tetrahedron vertices
+        return [
+            np.array([1, 1, 1]) / np.sqrt(3),
+            np.array([1, -1, -1]) / np.sqrt(3),
+            np.array([-1, 1, -1]) / np.sqrt(3),
+            np.array([-1, -1, 1]) / np.sqrt(3),
+        ]
+    elif geometry == "octahedral":
+        return [
+            np.array([1, 0, 0]), np.array([-1, 0, 0]),
+            np.array([0, 1, 0]), np.array([0, -1, 0]),
+            np.array([0, 0, 1]), np.array([0, 0, -1]),
+        ]
+    elif geometry == "square_planar":
+        return [
+            np.array([1, 0, 0]), np.array([-1, 0, 0]),
+            np.array([0, 1, 0]), np.array([0, -1, 0]),
+        ]
+    elif geometry == "trigonal_bipyramidal":
+        cos120 = -0.5
+        sin120 = np.sqrt(3) / 2
+        return [
+            np.array([1, 0, 0]),
+            np.array([cos120, sin120, 0]),
+            np.array([cos120, -sin120, 0]),
+            np.array([0, 0, 1]),
+            np.array([0, 0, -1]),
+        ]
+    elif geometry == "square_pyramidal":
+        return [
+            np.array([1, 0, 0]), np.array([-1, 0, 0]),
+            np.array([0, 1, 0]), np.array([0, -1, 0]),
+            np.array([0, 0, 1]),
+        ]
+    elif geometry == "linear":
+        return [np.array([0, 0, 1]), np.array([0, 0, -1])]
+    elif geometry == "trigonal_planar":
+        cos120 = -0.5
+        sin120 = np.sqrt(3) / 2
+        return [
+            np.array([1, 0, 0]),
+            np.array([cos120, sin120, 0]),
+            np.array([cos120, -sin120, 0]),
+        ]
+    else:
+        # Fallback: distribute cn points on sphere using Fibonacci spiral
+        dirs = []
+        golden_ratio = (1 + np.sqrt(5)) / 2
+        for i in range(cn):
+            theta = np.arccos(1 - 2 * (i + 0.5) / cn)
+            phi = 2 * np.pi * i / golden_ratio
+            dirs.append(np.array([
+                np.sin(theta) * np.cos(phi),
+                np.sin(theta) * np.sin(phi),
+                np.cos(theta),
+            ]))
+        return dirs
+
+
+def inject_dummy_atoms_pdbqt(
+    pdbqt_path: str,
+    vacant_positions: List[np.ndarray],
+    output_path: str,
+) -> str:
+    """
+    Inject dummy atoms at vacant coordination sites into receptor PDBQT.
+
+    The dummy atoms are typed as "HD" (hydrogen bond donor) which creates
+    an attractive potential for N/O/S acceptor atoms on the ligand.
+    This follows the MetalDock/AutoDock4Zn approach.
+
+    Args:
+        pdbqt_path: path to original receptor PDBQT.
+        vacant_positions: 3D coordinates for dummy atoms.
+        output_path: path to write modified PDBQT.
+
+    Returns:
+        Path to the modified PDBQT file.
+    """
+    with open(pdbqt_path, "r") as f:
+        lines = f.readlines()
+
+    # Find the last ATOM/HETATM line to get the serial number
+    last_serial = 0
+    insert_idx = len(lines)
+    for i, line in enumerate(lines):
+        if line.startswith(("ATOM", "HETATM")):
+            try:
+                last_serial = int(line[6:11])
+            except ValueError:
+                pass
+            insert_idx = i + 1
+        elif line.strip() in ("END", "ENDMDL"):
+            insert_idx = i
+            break
+
+    # Build dummy atom PDBQT lines
+    dummy_lines = []
+    for j, pos in enumerate(vacant_positions):
+        serial = last_serial + j + 1
+        x, y, z = pos
+        # PDBQT format: HETATM with atom type "HD" (H-bond donor)
+        # This makes Vina's H-bond scoring term attractive for N/O/S
+        line = (
+            f"HETATM{serial:5d}  DU  DUM Z{j+1:4d}    "
+            f"{x:8.3f}{y:8.3f}{z:8.3f}"
+            f"  1.00  0.00           HD\n"
+        )
+        dummy_lines.append(line)
+
+    # Insert dummy atoms
+    modified = lines[:insert_idx] + dummy_lines + lines[insert_idx:]
+
+    with open(output_path, "w") as f:
+        f.writelines(modified)
+
+    return output_path
+
+
 class VinaEngine:
     """
     AutoDock Vina docking engine wrapper.
 
-    Uses the vina Python package for docking.
+    Uses the vina Python package for docking.  When a coordination
+    hypothesis is provided, injects dummy atoms at vacant coordination
+    sites (MetalDock/AutoDock4Zn approach) to guide ligand donors
+    toward the metal.
     """
 
     def __init__(
@@ -60,12 +248,14 @@ class VinaEngine:
         energy_range: float = 5.0,
         seed: int = 42,
         cpu: int = 0,
+        use_dummy_atoms: bool = True,
     ) -> None:
         self.exhaustiveness = exhaustiveness
         self.num_modes = num_modes
         self.energy_range = energy_range
         self.seed = seed
         self.cpu = cpu
+        self.use_dummy_atoms = use_dummy_atoms
 
     def dock(
         self,
@@ -77,7 +267,8 @@ class VinaEngine:
         Run Vina docking.
 
         If a hypothesis is provided, the box is centered on the metal site
-        with tighter constraints.
+        and dummy atoms are injected at vacant coordination sites to guide
+        ligand donors toward the metal (MetalDock/AutoDock4Zn approach).
         """
         from vina import Vina
 
@@ -86,8 +277,21 @@ class VinaEngine:
         if not ligand.pdbqt_string or not ligand.pdbqt_string.strip():
             raise RuntimeError("Ligand PDBQT not available.")
 
+        # Inject dummy atoms at coordination vacancies if hypothesis given
+        receptor_pdbqt = receptor.pdbqt_path
+        _tmpdir = None
+        if hypothesis is not None and self.use_dummy_atoms:
+            vacant = compute_vacant_coordination_sites(hypothesis)
+            if vacant:
+                _tmpdir = tempfile.mkdtemp(prefix="vina_dummy_")
+                modified_path = os.path.join(_tmpdir, "receptor_dummy.pdbqt")
+                receptor_pdbqt = inject_dummy_atoms_pdbqt(
+                    receptor.pdbqt_path, vacant, modified_path)
+                log.info("  Injected %d dummy atoms at coordination vacancies",
+                         len(vacant))
+
         v = Vina(sf_name="vina", cpu=self.cpu, seed=self.seed)
-        v.set_receptor(receptor.pdbqt_path)
+        v.set_receptor(receptor_pdbqt)
         v.set_ligand_from_string(ligand.pdbqt_string)
 
         # Box: center on metal site if hypothesis given
@@ -132,6 +336,11 @@ class VinaEngine:
                 engine="vina",
                 pdbqt_string=pdbqt_str,
             ))
+
+        # Cleanup temp directory for dummy-atom receptor
+        if _tmpdir is not None:
+            import shutil
+            shutil.rmtree(_tmpdir, ignore_errors=True)
 
         return poses
 
