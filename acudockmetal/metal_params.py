@@ -92,16 +92,8 @@ class MetalParams:
 
     @property
     def default_cn(self) -> int:
-        """Most common coordination number."""
-        cn_low, cn_high = self.typical_cn_range
-        # Return the CN with the most geometry options
-        best_cn = cn_low
-        best_count = 0
-        for cn, geoms in self.preferred_geometries.items():
-            if len(geoms) > best_count:
-                best_count = len(geoms)
-                best_cn = cn
-        return best_cn
+        """Most common coordination number (lowest in typical range)."""
+        return self.typical_cn_range[0]
 
     def get_ideal_distance(self, donor_element: str) -> float:
         """Get ideal metal-donor distance; fall back to generic if unknown."""
@@ -145,6 +137,8 @@ class MetalParameterLibrary:
         self._add_manganese()
         self._add_magnesium()
         self._add_calcium()
+        self._add_sodium()
+        self._add_potassium()
         self._add_lanthanide()
 
     # ------------------------------------------------------------------
@@ -293,6 +287,41 @@ class MetalParameterLibrary:
             lj_r_min=1.713, lj_epsilon=0.0300,
             c4_coefficient=120.0,
             notes="Larger ionic radius; higher CN (6-8); O-donor dominated.",
+        )
+
+    def _add_sodium(self) -> None:
+        self._metals["NA"] = MetalParams(
+            symbol="NA", name="Sodium",
+            common_oxidation_states=[1],
+            preferred_geometries={
+                5: ["trigonal_bipyramidal", "square_pyramidal"],
+                6: ["octahedral"],
+            },
+            ideal_distances={"O": 2.40, "N": 2.50},
+            preferred_donors=["O"],
+            typical_cn_range=(5, 6),
+            water_propensity=0.9,
+            lj_r_min=1.369, lj_epsilon=0.0874,
+            c4_coefficient=30.0,
+            notes="Hard Lewis acid; prefers O donors; often fully hydrated.",
+        )
+
+    def _add_potassium(self) -> None:
+        self._metals["K"] = MetalParams(
+            symbol="K", name="Potassium",
+            common_oxidation_states=[1],
+            preferred_geometries={
+                6: ["octahedral"],
+                7: ["pentagonal_bipyramidal"],
+                8: ["square_antiprismatic"],
+            },
+            ideal_distances={"O": 2.80, "N": 2.90},
+            preferred_donors=["O"],
+            typical_cn_range=(6, 8),
+            water_propensity=0.9,
+            lj_r_min=1.705, lj_epsilon=0.1936,
+            c4_coefficient=40.0,
+            notes="Large ionic radius; high CN; O-donor dominated.",
         )
 
     # ------------------------------------------------------------------

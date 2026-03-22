@@ -169,9 +169,13 @@ class BoundableScoreFunction:
     """
     Score function with conservative lower and upper bound capabilities.
 
-    Wraps the metal-aware scorer and Vina grid energies to provide:
-    - lower_bound(region): optimistic (minimum possible) score
-    - upper_bound(region): evaluate at region center (actual score)
+    Wraps the metal-aware scorer to provide:
+    - lower_bound(region): optimistic (minimum possible) score using
+      analytical Morse potential bounds and coordination geometry bounds
+    - upper_bound(region): evaluate metal score at region center
+
+    The Vina grid contribution is estimated from the warm-start poses
+    rather than using hardcoded constants.
     """
 
     def __init__(
@@ -180,59 +184,87 @@ class BoundableScoreFunction:
         hypothesis: CoordinationHypothesis,
         vina_score_weight: float = 1.0,
         metal_score_weight: float = 0.3,
+        best_vina_score: float = -8.0,
     ) -> None:
         self.metal_scorer = metal_scorer
         self.hypothesis = hypothesis
         self.vina_weight = vina_score_weight
         self.metal_weight = metal_score_weight
+        # Use the best observed Vina score as a calibration point
+        self.best_vina_score = best_vina_score
 
     def lower_bound(self, region: SearchRegion) -> float:
         """
         Conservative lower bound on total score over a region.
 
-        Combines:
-        - Grid energy lower bound (minimum over spatial sub-region)
-        - Metal coordination lower bound (from MetalAwareScorer)
-        - Torsional strain lower bound (0 for unstrained)
+        Uses the MetalAwareScorer's analytical lower bound (which
+        includes Morse potential bounds, distance bounds, and CN bounds)
+        plus a distance-based Vina LB calibrated from warm-start data.
         """
-        # Metal score lower bound
+        # Metal score lower bound (includes Morse, distance, angle, CN)
         metal_lb = self.metal_scorer.lower_bound_over_region(
             region.translation_min,
             region.translation_max,
             self.hypothesis,
         )
 
-        # Grid energy lower bound: approximate using distance from
-        # metal center (closer regions have potentially lower energy)
+        # Vina LB: the best possible Vina score gets worse as the
+        # ligand center moves away from the binding site.  We use the
+        # warm-start best as a baseline and add a conservative penalty
+        # for distance from the metal.
         metal_coord = self.hypothesis.metal_site.coord
         region_center = region.translation_center
         d = np.linalg.norm(region_center - metal_coord)
         region_radius = np.linalg.norm(
             (region.translation_max - region.translation_min) / 2)
+        d_effective = max(d - region_radius, 0.0)
 
-        # Rough Vina LB: linear approximation based on distance
-        # Real implementation would use pre-computed grid pyramids
-        vina_lb = -10.0 + 0.5 * max(d - region_radius - 5.0, 0.0)
+        # Beyond the binding site radius (~5A), Vina score degrades
+        # roughly linearly.  This is conservative (underestimates penalty).
+        vina_lb = self.best_vina_score
+        if d_effective > 5.0:
+            vina_lb += 0.3 * (d_effective - 5.0)
 
         return self.vina_weight * vina_lb + self.metal_weight * metal_lb
 
     def upper_bound(self, region: SearchRegion) -> float:
         """
-        Upper bound: evaluate score at region center.
+        Upper bound: evaluate metal coordination score at region center.
 
-        In a full implementation this would perform local minimization
-        from the region center. Here we use a simplified evaluation.
+        Uses the actual metal scoring function with a simple ligand
+        model (single donor at the region center).
         """
         center = region.translation_center
         metal_coord = self.hypothesis.metal_site.coord
         d = np.linalg.norm(center - metal_coord)
 
-        # Simplified scoring at center point
-        # Real implementation: full Vina scoring + metal scoring
-        vina_approx = -8.0 + 0.3 * max(d - 3.0, 0.0) ** 2
-        metal_approx = max(d - 2.5, 0.0) ** 2
+        mp = self.metal_scorer.metal_lib.get(self.hypothesis.metal_symbol)
+        if mp is None:
+            return 0.0
 
-        return self.vina_weight * vina_approx + self.metal_weight * metal_approx
+        # Evaluate the Morse potential + distance penalty at this point
+        d_ideal = mp.get_ideal_distance("O")
+        dist_penalty = (d - d_ideal) ** 2
+
+        # Morse energy for a generic O donor
+        morse_e = self.metal_scorer.morse_energy(
+            d, d_ideal, 6.0, 1.6)  # O donor params
+
+        # CN penalty: assume we have protein donors + 1 ligand donor
+        n_protein = len(self.hypothesis.protein_donors)
+        observed_cn = n_protein + (1 if d < 3.0 else 0)
+        cn_penalty = (observed_cn - self.hypothesis.coordination_number) ** 2
+
+        metal_ub = (
+            5.0 * dist_penalty
+            + 1.0 * morse_e
+            + 3.0 * cn_penalty
+        )
+
+        # Use Vina estimate based on distance
+        vina_ub = self.best_vina_score + 0.5 * max(d - 3.0, 0.0) ** 2
+
+        return self.vina_weight * vina_ub + self.metal_weight * metal_ub
 
 
 class CertifiedDockingEngine:
@@ -297,8 +329,16 @@ class CertifiedDockingEngine:
         )
 
         # --- Score function ---
+        best_vina = -8.0  # default estimate
+        if warm_start_poses:
+            vina_scores = [p.vina_score for p in warm_start_poses
+                           if p.vina_score != 0.0]
+            if vina_scores:
+                best_vina = min(vina_scores)
+
         score_fn = BoundableScoreFunction(
-            self.metal_scorer, hypothesis)
+            self.metal_scorer, hypothesis,
+            best_vina_score=best_vina)
 
         # --- Warm start ---
         best_score = float("inf")

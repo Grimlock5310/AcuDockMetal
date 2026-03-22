@@ -46,11 +46,199 @@ class DockingPose:
                 f"vina={self.vina_score:.1f})")
 
 
+def compute_vacant_coordination_sites(
+    hypothesis: CoordinationHypothesis,
+) -> List[np.ndarray]:
+    """
+    Compute ideal coordination positions for vacant sites around a metal.
+
+    Inspired by MetalDock/AutoDock4Zn: places dummy atoms at positions
+    where the coordination sphere has vacancies.  These positions are
+    computed from the coordination geometry template by finding ideal
+    directions that are not occupied by protein donors.
+
+    Args:
+        hypothesis: coordination hypothesis with metal site info.
+
+    Returns:
+        List of 3D coordinates for vacant coordination positions.
+    """
+    from acudockmetal.metal_params import GEOMETRY_TEMPLATES, MetalParameterLibrary
+
+    metal_coord = hypothesis.metal_site.coord
+    metal_lib = MetalParameterLibrary()
+    mp = metal_lib.get(hypothesis.metal_symbol)
+    if mp is None:
+        return []
+
+    # Get ideal bond length for placing dummy atoms
+    d_ideal = mp.get_ideal_distance("N")  # use N distance as reference
+
+    # Get existing donor directions (normalized)
+    protein_donors = hypothesis.protein_donors
+    occupied_dirs = []
+    for donor in protein_donors:
+        v = donor.coord - metal_coord
+        norm = np.linalg.norm(v)
+        if norm > 0.1:
+            occupied_dirs.append(v / norm)
+
+    # Generate ideal coordination directions from geometry template
+    template = GEOMETRY_TEMPLATES.get(hypothesis.geometry)
+    if template is None:
+        return []
+
+    cn = hypothesis.coordination_number
+    ideal_dirs = _generate_ideal_directions(cn, hypothesis.geometry)
+
+    # Find ideal directions not covered by existing donors
+    # A direction is "covered" if angle to a protein donor < 30 degrees
+    vacant_positions = []
+    for ideal_dir in ideal_dirs:
+        is_occupied = False
+        for occ in occupied_dirs:
+            cos_angle = np.dot(ideal_dir, occ)
+            if cos_angle > 0.866:  # cos(30 deg)
+                is_occupied = True
+                break
+        if not is_occupied:
+            pos = metal_coord + d_ideal * ideal_dir
+            vacant_positions.append(pos)
+
+    # Limit to open_slots
+    return vacant_positions[:hypothesis.open_slots]
+
+
+def _generate_ideal_directions(cn: int, geometry: str) -> List[np.ndarray]:
+    """Generate unit vectors for ideal coordination positions."""
+    if geometry == "tetrahedral":
+        # Regular tetrahedron vertices
+        return [
+            np.array([1, 1, 1]) / np.sqrt(3),
+            np.array([1, -1, -1]) / np.sqrt(3),
+            np.array([-1, 1, -1]) / np.sqrt(3),
+            np.array([-1, -1, 1]) / np.sqrt(3),
+        ]
+    elif geometry == "octahedral":
+        return [
+            np.array([1, 0, 0]), np.array([-1, 0, 0]),
+            np.array([0, 1, 0]), np.array([0, -1, 0]),
+            np.array([0, 0, 1]), np.array([0, 0, -1]),
+        ]
+    elif geometry == "square_planar":
+        return [
+            np.array([1, 0, 0]), np.array([-1, 0, 0]),
+            np.array([0, 1, 0]), np.array([0, -1, 0]),
+        ]
+    elif geometry == "trigonal_bipyramidal":
+        cos120 = -0.5
+        sin120 = np.sqrt(3) / 2
+        return [
+            np.array([1, 0, 0]),
+            np.array([cos120, sin120, 0]),
+            np.array([cos120, -sin120, 0]),
+            np.array([0, 0, 1]),
+            np.array([0, 0, -1]),
+        ]
+    elif geometry == "square_pyramidal":
+        return [
+            np.array([1, 0, 0]), np.array([-1, 0, 0]),
+            np.array([0, 1, 0]), np.array([0, -1, 0]),
+            np.array([0, 0, 1]),
+        ]
+    elif geometry == "linear":
+        return [np.array([0, 0, 1]), np.array([0, 0, -1])]
+    elif geometry == "trigonal_planar":
+        cos120 = -0.5
+        sin120 = np.sqrt(3) / 2
+        return [
+            np.array([1, 0, 0]),
+            np.array([cos120, sin120, 0]),
+            np.array([cos120, -sin120, 0]),
+        ]
+    else:
+        # Fallback: distribute cn points on sphere using Fibonacci spiral
+        dirs = []
+        golden_ratio = (1 + np.sqrt(5)) / 2
+        for i in range(cn):
+            theta = np.arccos(1 - 2 * (i + 0.5) / cn)
+            phi = 2 * np.pi * i / golden_ratio
+            dirs.append(np.array([
+                np.sin(theta) * np.cos(phi),
+                np.sin(theta) * np.sin(phi),
+                np.cos(theta),
+            ]))
+        return dirs
+
+
+def inject_dummy_atoms_pdbqt(
+    pdbqt_path: str,
+    vacant_positions: List[np.ndarray],
+    output_path: str,
+) -> str:
+    """
+    Inject dummy atoms at vacant coordination sites into receptor PDBQT.
+
+    The dummy atoms are typed as "HD" (hydrogen bond donor) which creates
+    an attractive potential for N/O/S acceptor atoms on the ligand.
+    This follows the MetalDock/AutoDock4Zn approach.
+
+    Args:
+        pdbqt_path: path to original receptor PDBQT.
+        vacant_positions: 3D coordinates for dummy atoms.
+        output_path: path to write modified PDBQT.
+
+    Returns:
+        Path to the modified PDBQT file.
+    """
+    with open(pdbqt_path, "r") as f:
+        lines = f.readlines()
+
+    # Find the last ATOM/HETATM line to get the serial number
+    last_serial = 0
+    insert_idx = len(lines)
+    for i, line in enumerate(lines):
+        if line.startswith(("ATOM", "HETATM")):
+            try:
+                last_serial = int(line[6:11])
+            except ValueError:
+                pass
+            insert_idx = i + 1
+        elif line.strip() in ("END", "ENDMDL"):
+            insert_idx = i
+            break
+
+    # Build dummy atom PDBQT lines
+    dummy_lines = []
+    for j, pos in enumerate(vacant_positions):
+        serial = last_serial + j + 1
+        x, y, z = pos
+        # PDBQT format: HETATM with atom type "HD" (H-bond donor)
+        # This makes Vina's H-bond scoring term attractive for N/O/S
+        line = (
+            f"HETATM{serial:5d}  DU  DUM Z{j+1:4d}    "
+            f"{x:8.3f}{y:8.3f}{z:8.3f}"
+            f"  1.00  0.00           HD\n"
+        )
+        dummy_lines.append(line)
+
+    # Insert dummy atoms
+    modified = lines[:insert_idx] + dummy_lines + lines[insert_idx:]
+
+    with open(output_path, "w") as f:
+        f.writelines(modified)
+
+    return output_path
+
+
 class VinaEngine:
     """
     AutoDock Vina docking engine wrapper.
 
-    Uses the vina Python package for docking.
+    Uses the vina Python package for docking.  When a coordination
+    hypothesis is provided, injects dummy atoms at vacant coordination
+    sites (MetalDock/AutoDock4Zn approach) to guide ligand donors
+    toward the metal.
     """
 
     def __init__(
@@ -60,12 +248,14 @@ class VinaEngine:
         energy_range: float = 5.0,
         seed: int = 42,
         cpu: int = 0,
+        use_dummy_atoms: bool = True,
     ) -> None:
         self.exhaustiveness = exhaustiveness
         self.num_modes = num_modes
         self.energy_range = energy_range
         self.seed = seed
         self.cpu = cpu
+        self.use_dummy_atoms = use_dummy_atoms
 
     def dock(
         self,
@@ -77,7 +267,8 @@ class VinaEngine:
         Run Vina docking.
 
         If a hypothesis is provided, the box is centered on the metal site
-        with tighter constraints.
+        and dummy atoms are injected at vacant coordination sites to guide
+        ligand donors toward the metal (MetalDock/AutoDock4Zn approach).
         """
         from vina import Vina
 
@@ -86,8 +277,21 @@ class VinaEngine:
         if not ligand.pdbqt_string or not ligand.pdbqt_string.strip():
             raise RuntimeError("Ligand PDBQT not available.")
 
+        # Inject dummy atoms at coordination vacancies if hypothesis given
+        receptor_pdbqt = receptor.pdbqt_path
+        _tmpdir = None
+        if hypothesis is not None and self.use_dummy_atoms:
+            vacant = compute_vacant_coordination_sites(hypothesis)
+            if vacant:
+                _tmpdir = tempfile.mkdtemp(prefix="vina_dummy_")
+                modified_path = os.path.join(_tmpdir, "receptor_dummy.pdbqt")
+                receptor_pdbqt = inject_dummy_atoms_pdbqt(
+                    receptor.pdbqt_path, vacant, modified_path)
+                log.info("  Injected %d dummy atoms at coordination vacancies",
+                         len(vacant))
+
         v = Vina(sf_name="vina", cpu=self.cpu, seed=self.seed)
-        v.set_receptor(receptor.pdbqt_path)
+        v.set_receptor(receptor_pdbqt)
         v.set_ligand_from_string(ligand.pdbqt_string)
 
         # Box: center on metal site if hypothesis given
@@ -132,6 +336,11 @@ class VinaEngine:
                 engine="vina",
                 pdbqt_string=pdbqt_str,
             ))
+
+        # Cleanup temp directory for dummy-atom receptor
+        if _tmpdir is not None:
+            import shutil
+            shutil.rmtree(_tmpdir, ignore_errors=True)
 
         return poses
 
@@ -342,11 +551,23 @@ class GninaEngine:
         stdout: str,
     ) -> List[DockingPose]:
         """Update CNN scores from GNINA stdout."""
-        # Parse CNN scores from output
+        import re
+        # GNINA --score_only prints lines like:
+        #   Affinity: -7.5 (kcal/mol)
+        #   CNNscore: 0.85
+        #   CNNaffinity: 6.2
+        pose_idx = 0
         for line in stdout.splitlines():
-            if "CNNscore" in line or "CNNaffinity" in line:
-                # GNINA prints structured output; parse what we can
-                pass
+            line = line.strip()
+            m_cnn = re.match(r"CNNscore:\s+([\d.eE+-]+)", line)
+            if m_cnn and pose_idx < len(poses):
+                poses[pose_idx].gnina_cnn_score = float(m_cnn.group(1))
+
+            m_aff = re.match(r"CNNaffinity:\s+([\d.eE+-]+)", line)
+            if m_aff and pose_idx < len(poses):
+                poses[pose_idx].gnina_cnn_affinity = float(m_aff.group(1))
+                pose_idx += 1  # CNNaffinity is printed last per pose
+
         return poses
 
 
@@ -418,8 +639,25 @@ class DockingOrchestrator:
 
         return all_poses
 
+    @staticmethod
+    def _kabsch_rmsd(coords_a: np.ndarray, coords_b: np.ndarray) -> float:
+        """Compute RMSD after optimal superposition (Kabsch algorithm)."""
+        centroid_a = coords_a.mean(axis=0)
+        centroid_b = coords_b.mean(axis=0)
+        a_centered = coords_a - centroid_a
+        b_centered = coords_b - centroid_b
+
+        H = a_centered.T @ b_centered
+        U, S, Vt = np.linalg.svd(H)
+        d = np.linalg.det(Vt.T @ U.T)
+        sign_matrix = np.diag([1.0, 1.0, np.sign(d)])
+        R = Vt.T @ sign_matrix @ U.T
+
+        a_rotated = a_centered @ R.T
+        return float(np.sqrt(np.mean((a_rotated - b_centered) ** 2)))
+
     def _cluster_poses(self, poses: List[DockingPose]) -> List[DockingPose]:
-        """Simple greedy RMSD-based clustering."""
+        """Greedy RMSD-based clustering with Kabsch alignment."""
         if len(poses) < 2:
             for p in poses:
                 p.cluster_id = 0
@@ -437,8 +675,7 @@ class DockingOrchestrator:
             assigned = False
             for ci, rep_coords in enumerate(representatives):
                 if rep_coords.shape == pose.coordinates.shape:
-                    rmsd = np.sqrt(np.mean(
-                        (rep_coords - pose.coordinates) ** 2))
+                    rmsd = self._kabsch_rmsd(rep_coords, pose.coordinates)
                     if rmsd < self.cluster_rmsd:
                         pose.cluster_id = ci
                         assigned = True
@@ -448,6 +685,101 @@ class DockingOrchestrator:
                 pose.cluster_id = cluster_id
                 representatives.append(pose.coordinates.copy())
                 cluster_id += 1
+
+        return poses
+
+    def refine_coordination(
+        self,
+        poses: List[DockingPose],
+        hypotheses: List[CoordinationHypothesis],
+        ligand_elements: List[str],
+        top_n: int = 20,
+    ) -> List[DockingPose]:
+        """
+        Post-docking coordination refinement for top poses.
+
+        For each top pose, optimize ligand donor positions to improve
+        metal-donor distances and angles using constrained minimization.
+        Inspired by GOLD's coordination constraint fitting.
+
+        Args:
+            poses: docked poses sorted by score.
+            hypotheses: coordination hypotheses.
+            ligand_elements: element symbols for ligand atoms.
+            top_n: number of top poses to refine.
+
+        Returns:
+            Updated poses with refined coordinates.
+        """
+        from scipy.optimize import minimize as scipy_minimize
+
+        donor_element_set = {"N", "O", "S", "CL"}
+        from acudockmetal.metal_params import MetalParameterLibrary
+        metal_lib = MetalParameterLibrary()
+
+        for pose in poses[:top_n]:
+            if pose.coordinates.size == 0:
+                continue
+
+            hyp = None
+            for h in hypotheses:
+                if h.hypothesis_id == pose.hypothesis_id:
+                    hyp = h
+                    break
+            if hyp is None:
+                continue
+
+            metal_coord = hyp.metal_site.coord
+            mp = metal_lib.get(hyp.metal_symbol)
+            if mp is None:
+                continue
+
+            # Identify donor atoms in this pose
+            donor_indices = []
+            for i, (c, e) in enumerate(zip(pose.coordinates, ligand_elements)):
+                if e.upper() in donor_element_set:
+                    d = np.linalg.norm(c - metal_coord)
+                    if d < 4.0:  # wider cutoff for refinement
+                        donor_indices.append(i)
+
+            if not donor_indices:
+                continue
+
+            # Optimize donor positions to minimize coordination penalty
+            original_coords = pose.coordinates.copy()
+            donor_coords_flat = original_coords[donor_indices].flatten()
+
+            def objective(x):
+                coords = x.reshape(-1, 3)
+                total = 0.0
+                for j, di in enumerate(donor_indices):
+                    elem = ligand_elements[di].upper()
+                    d = np.linalg.norm(coords[j] - metal_coord)
+                    d_ideal = mp.get_ideal_distance(elem)
+                    total += 5.0 * (d - d_ideal) ** 2
+
+                    # Displacement penalty to prevent large moves
+                    disp = np.linalg.norm(coords[j] - original_coords[di])
+                    total += 2.0 * disp ** 2
+                return total
+
+            result = scipy_minimize(
+                objective, donor_coords_flat,
+                method="L-BFGS-B",
+                options={"maxiter": 50, "ftol": 1e-6},
+            )
+
+            if result.success:
+                refined = result.x.reshape(-1, 3)
+                new_coords = original_coords.copy()
+                for j, di in enumerate(donor_indices):
+                    # Limit displacement to 0.5 A
+                    delta = refined[j] - original_coords[di]
+                    norm = np.linalg.norm(delta)
+                    if norm > 0.5:
+                        delta = delta * 0.5 / norm
+                    new_coords[di] = original_coords[di] + delta
+                pose.coordinates = new_coords
 
         return poses
 
