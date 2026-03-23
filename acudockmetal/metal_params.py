@@ -139,6 +139,10 @@ class MetalParameterLibrary:
         self._add_calcium()
         self._add_sodium()
         self._add_potassium()
+        self._add_mercury()
+        self._add_cadmium()
+        self._add_vanadium()
+        self._add_gadolinium()
         self._add_lanthanide()
 
     # ------------------------------------------------------------------
@@ -322,6 +326,82 @@ class MetalParameterLibrary:
             lj_r_min=1.705, lj_epsilon=0.1936,
             c4_coefficient=40.0,
             notes="Large ionic radius; high CN; O-donor dominated.",
+        )
+
+    # ------------------------------------------------------------------
+    # Additional metals (from GOLD's supported set)
+    # ------------------------------------------------------------------
+    def _add_mercury(self) -> None:
+        self._metals["HG"] = MetalParams(
+            symbol="HG", name="Mercury",
+            common_oxidation_states=[1, 2],
+            preferred_geometries={
+                2: ["linear"],
+                4: ["tetrahedral"],
+                6: ["octahedral"],
+            },
+            ideal_distances={"N": 2.30, "O": 2.25, "S": 2.35, "CL": 2.30},
+            preferred_donors=["S", "N"],
+            typical_cn_range=(2, 6),
+            water_propensity=0.3,
+            lj_r_min=1.580, lj_epsilon=0.0200,
+            c4_coefficient=110.0,
+            notes="Soft Lewis acid; strong S-donor preference (thiophilic); "
+                  "linear CN=2 common for Hg(II).",
+        )
+
+    def _add_cadmium(self) -> None:
+        self._metals["CD"] = MetalParams(
+            symbol="CD", name="Cadmium",
+            common_oxidation_states=[2],
+            preferred_geometries={
+                4: ["tetrahedral"],
+                5: ["trigonal_bipyramidal"],
+                6: ["octahedral"],
+            },
+            ideal_distances={"N": 2.25, "O": 2.30, "S": 2.50, "CL": 2.45},
+            preferred_donors=["S", "N", "O"],
+            typical_cn_range=(4, 6),
+            water_propensity=0.4,
+            lj_r_min=1.490, lj_epsilon=0.0150,
+            c4_coefficient=95.0,
+            notes="Often substitutes for Zn in structural studies; "
+                  "softer Lewis acid than Zn.",
+        )
+
+    def _add_vanadium(self) -> None:
+        self._metals["V"] = MetalParams(
+            symbol="V", name="Vanadium",
+            common_oxidation_states=[3, 4, 5],
+            preferred_geometries={
+                5: ["trigonal_bipyramidal", "square_pyramidal"],
+                6: ["octahedral"],
+            },
+            ideal_distances={"N": 2.10, "O": 1.95, "S": 2.35},
+            preferred_donors=["O", "N"],
+            typical_cn_range=(5, 6),
+            water_propensity=0.5,
+            lj_r_min=1.430, lj_epsilon=0.0140,
+            c4_coefficient=98.0,
+            notes="Multiple oxidation states; strong O-donor preference; "
+                  "vanadate chemistry.",
+        )
+
+    def _add_gadolinium(self) -> None:
+        self._metals["GD"] = MetalParams(
+            symbol="GD", name="Gadolinium",
+            common_oxidation_states=[3],
+            preferred_geometries={
+                8: ["square_antiprismatic"],
+                9: ["tricapped_trigonal_prismatic"],
+            },
+            ideal_distances={"O": 2.37, "N": 2.50, "S": 2.85},
+            preferred_donors=["O", "N"],
+            typical_cn_range=(8, 9),
+            water_propensity=0.8,
+            lj_r_min=1.740, lj_epsilon=0.0340,
+            c4_coefficient=145.0,
+            notes="MRI contrast agent; high CN (8-9); O-donor dominated.",
         )
 
     # ------------------------------------------------------------------

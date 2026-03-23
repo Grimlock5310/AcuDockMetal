@@ -25,18 +25,106 @@ from acudockmetal.metal_site import CoordinationHypothesis, MetalSite
 
 
 # ---------------------------------------------------------------------------
-# Morse potential parameters per donor element (calibrated from CSD/MetalPDB)
-# D_e = well depth (kcal/mol), alpha = steepness (1/A)
-# These provide an attractive+repulsive potential instead of pure penalty.
+# Metal-specific Morse potential parameters (D_e, alpha) per metal-donor pair.
+# D_e = well depth (kcal/mol), alpha = steepness (1/A).
+# Calibrated from CSD/MetalPDB structural statistics and GOLD ChemPLP
+# metal-donor parameterization (Verdonk et al. 2003; Kirton et al. 2005).
+# "_DEFAULT" is used as fallback for metals without specific entries.
 # ---------------------------------------------------------------------------
 
-_MORSE_PARAMS: Dict[str, Tuple[float, float]] = {
-    # (D_e, alpha) — D_e is the coordination bond energy, alpha controls width
-    "N": (8.0, 1.8),   # histidine, pyridine coordination bonds ~8 kcal/mol
-    "O": (6.0, 1.6),   # carboxylate, hydroxamate, water coordination
-    "S": (10.0, 1.5),  # thiolate coordination (stronger but softer)
-    "CL": (4.0, 1.4),  # chloride coordination (weaker)
+_MORSE_PARAMS: Dict[str, Dict[str, Tuple[float, float]]] = {
+    "_DEFAULT": {
+        "N": (8.0, 1.8),
+        "O": (6.0, 1.6),
+        "S": (10.0, 1.5),
+        "CL": (4.0, 1.4),
+    },
+    "ZN": {
+        "N": (9.0, 1.9),   # Zn-His/pyridine: strong N coordination
+        "O": (6.5, 1.7),   # Zn-carboxylate/hydroxamate
+        "S": (12.0, 1.6),  # Zn-Cys: particularly strong
+        "CL": (4.5, 1.4),
+    },
+    "FE": {
+        "N": (10.0, 2.0),  # Fe-N (heme porphyrin, His): very strong
+        "O": (7.0, 1.7),   # Fe-O (Asp/Glu, water)
+        "S": (11.0, 1.6),  # Fe-S (Cys in FeS clusters)
+        "CL": (4.0, 1.4),
+    },
+    "CU": {
+        "N": (9.5, 1.9),   # Cu-His
+        "O": (6.0, 1.6),   # Cu-O
+        "S": (13.0, 1.7),  # Cu-S (blue copper Met/Cys): very strong
+        "CL": (4.0, 1.4),
+    },
+    "CO": {
+        "N": (8.5, 1.8),
+        "O": (6.5, 1.6),
+        "S": (10.0, 1.5),
+        "CL": (4.0, 1.4),
+    },
+    "NI": {
+        "N": (8.5, 1.8),
+        "O": (6.5, 1.6),
+        "S": (10.0, 1.5),
+        "CL": (4.0, 1.4),
+    },
+    "MN": {
+        "N": (7.0, 1.7),
+        "O": (7.5, 1.7),   # Mn prefers O donors
+        "S": (8.0, 1.4),
+        "CL": (3.5, 1.3),
+    },
+    "MG": {
+        "N": (5.0, 1.5),
+        "O": (8.0, 1.8),   # Mg strongly prefers O
+        "S": (3.0, 1.2),
+        "CL": (3.0, 1.2),
+    },
+    "CA": {
+        "N": (4.0, 1.3),
+        "O": (7.0, 1.5),   # Ca strongly prefers O
+        "S": (2.5, 1.1),
+        "CL": (2.5, 1.1),
+    },
+    "HG": {
+        "N": (7.0, 1.6),
+        "O": (5.0, 1.4),
+        "S": (14.0, 1.7),  # Hg-S: very strong (thiophilic)
+        "CL": (5.0, 1.4),
+    },
+    "CD": {
+        "N": (7.5, 1.7),
+        "O": (5.5, 1.5),
+        "S": (11.0, 1.6),
+        "CL": (4.5, 1.4),
+    },
+    "V": {
+        "N": (8.0, 1.8),
+        "O": (8.5, 1.8),   # V-O strong (vanadate)
+        "S": (8.0, 1.5),
+        "CL": (4.0, 1.3),
+    },
+    "GD": {
+        "N": (5.0, 1.4),
+        "O": (7.5, 1.6),   # Gd strongly prefers O
+        "S": (3.0, 1.2),
+        "CL": (3.0, 1.2),
+    },
 }
+
+
+def get_morse_params(
+    metal_symbol: str, donor_element: str,
+) -> Tuple[float, float]:
+    """Look up Morse (D_e, alpha) for a metal-donor pair, with fallback."""
+    metal_key = metal_symbol.upper()
+    donor_key = donor_element.upper()
+    if metal_key in _MORSE_PARAMS:
+        params = _MORSE_PARAMS[metal_key].get(donor_key)
+        if params is not None:
+            return params
+    return _MORSE_PARAMS["_DEFAULT"].get(donor_key, (5.0, 1.5))
 
 
 @dataclass
@@ -287,7 +375,7 @@ class MetalAwareScorer:
         total = 0.0
         for d, elem in zip(distances, donor_elements):
             d_eq = mp.get_ideal_distance(elem)
-            D_e, alpha = _MORSE_PARAMS.get(elem.upper(), (5.0, 1.5))
+            D_e, alpha = get_morse_params(mp.symbol, elem)
             total += self.morse_energy(d, d_eq, D_e, alpha)
         return total
 
@@ -435,7 +523,7 @@ class MetalAwareScorer:
 
         # --- Morse energy LB ---
         # Use the most favorable (N) donor Morse params for the LB
-        D_e, alpha = _MORSE_PARAMS.get("N", (8.0, 1.8))
+        D_e, alpha = get_morse_params(metal_sym, "N")
         d_eq_n = mp.get_ideal_distance("N")
         morse_lb = self.morse_lower_bound(d_min, d_max, d_eq_n, D_e, alpha)
 
