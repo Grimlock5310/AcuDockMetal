@@ -510,20 +510,30 @@ class LigandPreparator:
 
     def _to_pdbqt_obabel(self, pdb_path: str,
                           use_gasteiger: bool = True) -> str:
-        """Fallback PDBQT conversion using Open Babel."""
+        """Fallback PDBQT conversion using Open Babel.
+
+        Writes to a temp file rather than stdout because obabel's PDBQT
+        writer produces empty output when piped to stdout.
+        """
         import subprocess
-        cmd = ["obabel", pdb_path, "-O", "-", "-opdbqt"]
-        # Gasteiger charges silently drop metal complexes in obabel 3.x
-        if use_gasteiger:
-            cmd += ["--partialcharge", "gasteiger"]
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=60,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"obabel failed: {result.stderr.strip()}")
-        if not result.stdout.strip():
-            raise RuntimeError("obabel returned empty PDBQT")
-        return result.stdout
+        tmp_pdbqt = pdb_path + ".pdbqt"
+        try:
+            cmd = ["obabel", pdb_path, "-O", tmp_pdbqt]
+            # Gasteiger charges silently drop metal complexes in obabel 3.x
+            if use_gasteiger:
+                cmd += ["--partialcharge", "gasteiger"]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"obabel failed: {result.stderr.strip()}")
+            if not os.path.exists(tmp_pdbqt) or os.path.getsize(tmp_pdbqt) == 0:
+                raise RuntimeError("obabel returned empty PDBQT")
+            with open(tmp_pdbqt) as f:
+                return f.read()
+        finally:
+            if os.path.exists(tmp_pdbqt):
+                os.unlink(tmp_pdbqt)
 
     def _smiles_to_pdbqt_obabel(self, smiles: str) -> str:
         """Generate 3D coords and PDBQT directly from SMILES via obabel.
