@@ -125,6 +125,9 @@ class PipelineResult:
             f"Hypotheses: {len(self.hypotheses)}",
             f"Docking poses: {len(self.docking_poses)}",
         ]
+        if self.prepared_receptor and self.prepared_receptor.notes:
+            for note in self.prepared_receptor.notes:
+                lines.append(f"  Note: {note}")
         if self.best_pose:
             lines.append(
                 f"Best pose: Vina={self.best_pose.vina_score:.2f} kcal/mol")
@@ -252,6 +255,11 @@ class AcuDockMetalPipeline:
             result.timing["preparation"] = time.time() - t0
             return result
         result.timing["receptor_prep"] = time.time() - t0
+
+        if not receptor.pdbqt_path:
+            log.warning("Receptor PDBQT conversion failed; docking cannot "
+                        "proceed. Notes: %s", "; ".join(receptor.notes))
+            return result
 
         # --- Step 2: Prepare ligand ---
         t0 = time.time()
