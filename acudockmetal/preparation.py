@@ -279,6 +279,9 @@ class ReceptorPreparator:
             raise RuntimeError(
                 "PDBQT conversion failed — neither "
                 "mk_prepare_receptor.py nor obabel available")
+        if not os.path.isfile(pdbqt_path) or os.path.getsize(pdbqt_path) == 0:
+            raise RuntimeError(
+                f"obabel produced empty or missing PDBQT: {pdbqt_path}")
 
     def _center_of_mass(self, pdb_path: str) -> np.ndarray:
         """Compute center of mass from a PDB file."""
@@ -420,21 +423,25 @@ class LigandPreparator:
                 for ti, t in enumerate(tauts):
                     if ti >= self.max_tautomers:
                         break
-                    t = Chem.AddHs(t)
-                    t_ok = AllChem.EmbedMolecule(t, AllChem.ETKDGv3())
-                    if t_ok != -1:
-                        try:
-                            AllChem.MMFFOptimizeMolecule(t, maxIters=200)
-                        except Exception:
-                            pass
-                    elif has_metal:
-                        try:
-                            t = self._embed_metalloligand(t)
-                        except Exception:
-                            continue  # skip this tautomer
-                    else:
-                        continue  # skip tautomers without 3D coords
-                    mols_to_process.append((f"tautomer_{ti}", t))
+                    try:
+                        t = Chem.AddHs(t)
+                        t_ok = AllChem.EmbedMolecule(t, AllChem.ETKDGv3())
+                        if t_ok != -1:
+                            try:
+                                AllChem.MMFFOptimizeMolecule(t, maxIters=200)
+                            except Exception:
+                                pass
+                        elif has_metal:
+                            try:
+                                t = self._embed_metalloligand(t)
+                            except Exception:
+                                continue  # skip this tautomer
+                        else:
+                            continue  # skip tautomers without 3D coords
+                        mols_to_process.append((f"tautomer_{ti}", t))
+                    except Exception as e:
+                        log.debug("Skipping tautomer %d: %s", ti, e)
+                        continue
             except Exception as e:
                 log.warning("Tautomer enumeration failed: %s", e)
 

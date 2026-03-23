@@ -11,6 +11,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -362,16 +363,22 @@ class VinaEngine:
             center = hypothesis.metal_site.coord.tolist()
 
         v.compute_vina_maps(center=center, box_size=size)
+        log.info("  Starting Vina docking (exhaustiveness=%d, n_poses=%d, "
+                 "scoring=%s)...", self.exhaustiveness, self.num_modes, sf_name)
+        t0 = time.monotonic()
         v.dock(
             exhaustiveness=self.exhaustiveness,
             n_poses=self.num_modes,
         )
+        elapsed = time.monotonic() - t0
+        log.info("  Vina docking completed in %.1f s", elapsed)
 
         # Extract results
         energies = v.energies()
         poses: List[DockingPose] = []
 
         if energies is None or len(energies) == 0:
+            log.warning("Vina returned no poses/energies.")
             return poses
 
         for i, energy_row in enumerate(energies):
@@ -382,8 +389,8 @@ class VinaEngine:
             try:
                 pdbqt_str = v.poses(n_poses=i + 1).split("MODEL")[
                     -1] if i == 0 else ""
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("Pose PDBQT extraction failed for pose %d: %s", i, e)
 
             # Extract coordinates from the Vina output
             coords = self._extract_coords_from_vina(v, i)
@@ -411,8 +418,8 @@ class VinaEngine:
             models = pdbqt_all.strip().split("ENDMDL")
             if pose_idx < len(models):
                 return self._parse_pdbqt_coords(models[pose_idx])
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("Coord extraction failed for pose %d: %s", pose_idx, e)
         return np.zeros((0, 3))
 
     @staticmethod
@@ -665,8 +672,14 @@ class DockingOrchestrator:
         all_poses: List[DockingPose] = []
         pose_counter = 0
 
-        for hyp in hypotheses:
-            log.info("Docking hypothesis: %s", hyp.label)
+        if not receptor.pdbqt_path:
+            log.error("Receptor PDBQT not available — skipping all %d "
+                      "hypotheses.", len(hypotheses))
+            return all_poses
+
+        n_hyp = len(hypotheses)
+        for idx, hyp in enumerate(hypotheses, 1):
+            log.info("Docking hypothesis %d/%d: %s", idx, n_hyp, hyp.label)
 
             # --- Vina ---
             try:
