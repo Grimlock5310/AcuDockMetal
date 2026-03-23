@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from acudockmetal.docking_engines import DockingPose
-from acudockmetal.metal_scoring import MetalAwareScorer
+from acudockmetal.metal_scoring import MetalAwareScorer, get_morse_params
 from acudockmetal.metal_site import CoordinationHypothesis
 
 log = logging.getLogger(__name__)
@@ -242,13 +242,16 @@ class BoundableScoreFunction:
         if mp is None:
             return 0.0
 
-        # Evaluate the Morse potential + distance penalty at this point
-        d_ideal = mp.get_ideal_distance("O")
+        # Use the metal's primary preferred donor type (not hardcoded O)
+        preferred_donor = (
+            mp.preferred_donors[0] if mp.preferred_donors else "O")
+        d_ideal = mp.get_ideal_distance(preferred_donor)
         dist_penalty = (d - d_ideal) ** 2
 
-        # Morse energy for a generic O donor
-        morse_e = self.metal_scorer.morse_energy(
-            d, d_ideal, 6.0, 1.6)  # O donor params
+        # Morse energy for the preferred donor type
+        D_e, alpha = get_morse_params(
+            self.hypothesis.metal_symbol, preferred_donor)
+        morse_e = self.metal_scorer.morse_energy(d, d_ideal, D_e, alpha)
 
         # CN penalty: assume we have protein donors + 1 ligand donor
         n_protein = len(self.hypothesis.protein_donors)

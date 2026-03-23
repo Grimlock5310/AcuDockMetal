@@ -25,7 +25,8 @@ log = logging.getLogger(__name__)
 # Elements recognized as metal ions in PDB HETATM records
 _METAL_ELEMENTS = {
     "ZN", "FE", "CU", "CO", "NI", "MN", "MG", "CA", "NA", "K",
-    "LA", "CE", "PR", "ND", "SM", "EU", "GD", "TB",
+    "HG", "CD", "V", "GD",
+    "LA", "CE", "PR", "ND", "SM", "EU", "TB",
     "DY", "HO", "ER", "TM", "YB", "LU",
 }
 
@@ -394,7 +395,16 @@ class LigandPreparator:
                 AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
             except Exception:
                 pass  # MMFF may not support metals
-        else:
+        elif has_metal:
+            # Strip-metal-embed-reassemble: remove metal, embed organic
+            # fragment, then place metal at ideal coordination position
+            try:
+                mol = self._embed_metalloligand(mol)
+                conf_ok = 0
+                log.info("Metalloligand embedded via strip-metal-reassemble.")
+            except Exception as e:
+                log.warning("Metalloligand embedding failed: %s", e)
+        if conf_ok == -1:
             log.warning("Could not generate 3D conformer; "
                         "PDBQT conversion may fail.")
 
@@ -411,8 +421,19 @@ class LigandPreparator:
                     if ti >= self.max_tautomers:
                         break
                     t = Chem.AddHs(t)
-                    AllChem.EmbedMolecule(t, AllChem.ETKDGv3())
-                    AllChem.MMFFOptimizeMolecule(t, maxIters=200)
+                    t_ok = AllChem.EmbedMolecule(t, AllChem.ETKDGv3())
+                    if t_ok != -1:
+                        try:
+                            AllChem.MMFFOptimizeMolecule(t, maxIters=200)
+                        except Exception:
+                            pass
+                    elif has_metal:
+                        try:
+                            t = self._embed_metalloligand(t)
+                        except Exception:
+                            continue  # skip this tautomer
+                    else:
+                        continue  # skip tautomers without 3D coords
                     mols_to_process.append((f"tautomer_{ti}", t))
             except Exception as e:
                 log.warning("Tautomer enumeration failed: %s", e)
@@ -524,6 +545,108 @@ class LigandPreparator:
         if not result.stdout.strip():
             raise RuntimeError("obabel --gen3d returned empty PDBQT")
         return result.stdout
+
+    def _embed_metalloligand(self, mol):
+        """
+        Embed a metal-containing ligand by stripping metal atoms, embedding
+        the organic fragment, then placing metals at ideal coordination
+        positions computed from donor atom geometry.
+
+        This bypasses UFF/MMFF which lack parameters for transition metals.
+        """
+        from rdkit import Chem
+        from rdkit.Chem import AllChem, rdmolops
+        from acudockmetal.metal_params import MetalParameterLibrary
+
+        metal_lib = MetalParameterLibrary()
+
+        # Identify metal atoms and their neighbors
+        rw = Chem.RWMol(mol)
+        metal_info = []  # [(atom_idx, atomic_num, [neighbor_indices])]
+        for atom in rw.GetAtoms():
+            anum = atom.GetAtomicNum()
+            sym = atom.GetSymbol().upper()
+            if sym in _METAL_ELEMENTS or anum > 20 or anum in (3, 4, 11, 12, 13, 19, 20):
+                neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
+                metal_info.append((atom.GetIdx(), anum, sym, neighbors))
+
+        if not metal_info:
+            raise ValueError("No metal atoms found in molecule")
+
+        # Remove metal atoms (highest index first to preserve indexing)
+        # Track the index mapping: old_idx -> new_idx
+        metal_indices = sorted([mi[0] for mi in metal_info], reverse=True)
+        removed = set()
+        for midx in metal_indices:
+            rw.RemoveAtom(midx)
+            removed.add(midx)
+
+        # Build index mapping (old non-metal idx -> new idx)
+        old_to_new = {}
+        new_idx = 0
+        for old_idx in range(mol.GetNumAtoms()):
+            if old_idx in removed:
+                continue
+            old_to_new[old_idx] = new_idx
+            new_idx += 1
+
+        # Embed the organic fragment
+        frag = rw.GetMol()
+        frag = Chem.AddHs(frag)
+        params = AllChem.ETKDGv3()
+        params.randomSeed = 42
+        ok = AllChem.EmbedMolecule(frag, params)
+        if ok == -1:
+            params.useRandomCoords = True
+            ok = AllChem.EmbedMolecule(frag, params)
+        if ok == -1:
+            raise RuntimeError("Cannot embed organic fragment")
+
+        try:
+            AllChem.MMFFOptimizeMolecule(frag, maxIters=500)
+        except Exception:
+            pass
+
+        frag_conf = frag.GetConformer()
+
+        # Now rebuild the full molecule with metal coordinates
+        # Start from the original mol and set coordinates
+        full_mol = Chem.RWMol(mol)
+        conf = Chem.Conformer(full_mol.GetNumAtoms())
+        conf.SetId(0)
+
+        # Set organic atom positions from the fragment conformer
+        for old_idx, new_idx in old_to_new.items():
+            if new_idx < frag_conf.GetNumAtoms():
+                pos = frag_conf.GetAtomPosition(new_idx)
+                conf.SetAtomPosition(old_idx, pos)
+
+        # Place each metal at the centroid of its donor neighbors,
+        # adjusted to ideal coordination distance
+        for midx, anum, sym, neighbor_idxs in metal_info:
+            mp = metal_lib.get(sym)
+            donor_positions = []
+            for nidx in neighbor_idxs:
+                if nidx in old_to_new and old_to_new[nidx] < frag_conf.GetNumAtoms():
+                    pos = frag_conf.GetAtomPosition(old_to_new[nidx])
+                    donor_positions.append(np.array([pos.x, pos.y, pos.z]))
+
+            if donor_positions:
+                centroid = np.mean(donor_positions, axis=0)
+                # Place metal at centroid (for coordination complexes,
+                # the metal should be roughly equidistant from all donors)
+                from rdkit.Geometry import Point3D
+                conf.SetAtomPosition(midx, Point3D(*centroid.tolist()))
+            else:
+                # No neighbors found — place at origin
+                from rdkit.Geometry import Point3D
+                conf.SetAtomPosition(midx, Point3D(0.0, 0.0, 0.0))
+
+        # Remove any existing conformers and add the new one
+        full_mol.RemoveAllConformers()
+        full_mol.AddConformer(conf, assignId=True)
+
+        return full_mol.GetMol()
 
     def summary(self, variants: List[PreparedLigand]) -> str:
         """Human-readable summary of prepared ligand variants."""

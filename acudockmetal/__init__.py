@@ -14,7 +14,7 @@ from acudockmetal.chelator_detect import ChelatingGroupDetector
 from acudockmetal.metal_site import MetalSiteDetector, CoordinationHypothesisGenerator
 from acudockmetal.preparation import ReceptorPreparator, LigandPreparator
 from acudockmetal.docking_engines import VinaEngine, GninaEngine, DockingOrchestrator
-from acudockmetal.metal_scoring import MetalAwareScorer
+from acudockmetal.metal_scoring import MetalAwareScorer, get_morse_params
 from acudockmetal.certified_dock import CertifiedDockingEngine
 from acudockmetal.rescoring import MultiFidelityRescorer
 from acudockmetal.validation import GeometryValidator

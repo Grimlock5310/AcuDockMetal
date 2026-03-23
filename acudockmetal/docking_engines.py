@@ -46,23 +46,35 @@ class DockingPose:
                 f"vina={self.vina_score:.1f})")
 
 
-def compute_vacant_coordination_sites(
+def compute_coordination_dummy_positions(
     hypothesis: CoordinationHypothesis,
+    mode: str = "metaldock",
 ) -> List[np.ndarray]:
     """
-    Compute ideal coordination positions for vacant sites around a metal.
+    Compute dummy atom positions around a metal for docking guidance.
 
-    Inspired by MetalDock/AutoDock4Zn: places dummy atoms at positions
-    where the coordination sphere has vacancies.  These positions are
-    computed from the coordination geometry template by finding ideal
-    directions that are not occupied by protein donors.
+    Supports two modes inspired by different docking approaches:
+
+    - **"metaldock"** (default): Places dummy atoms only at vacant
+      coordination sites (positions not occupied by protein donors).
+      This is the MetalDock single-vacancy approach.
+
+    - **"ad4zn"**: Places dummy atoms at ALL ideal coordination
+      positions, including those occupied by protein donors.  The
+      occupied-site dummies reinforce the coordination geometry,
+      while vacant-site dummies attract ligand donors.  This follows
+      the AutoDock4Zn approach.
 
     Args:
         hypothesis: coordination hypothesis with metal site info.
+        mode: "metaldock" for vacant-only or "ad4zn" for all positions.
 
     Returns:
-        List of 3D coordinates for vacant coordination positions.
+        List of 3D coordinates for dummy atom positions.
     """
+    if mode not in ("metaldock", "ad4zn"):
+        raise ValueError(f"Unknown mode '{mode}'; use 'metaldock' or 'ad4zn'")
+
     from acudockmetal.metal_params import GEOMETRY_TEMPLATES, MetalParameterLibrary
 
     metal_coord = hypothesis.metal_site.coord
@@ -91,9 +103,8 @@ def compute_vacant_coordination_sites(
     cn = hypothesis.coordination_number
     ideal_dirs = _generate_ideal_directions(cn, hypothesis.geometry)
 
-    # Find ideal directions not covered by existing donors
-    # A direction is "covered" if angle to a protein donor < 30 degrees
-    vacant_positions = []
+    # Collect positions based on mode
+    positions = []
     for ideal_dir in ideal_dirs:
         is_occupied = False
         for occ in occupied_dirs:
@@ -101,12 +112,19 @@ def compute_vacant_coordination_sites(
             if cos_angle > 0.866:  # cos(30 deg)
                 is_occupied = True
                 break
-        if not is_occupied:
+        # In ad4zn mode, include ALL positions; in metaldock, only vacant
+        if mode == "ad4zn" or not is_occupied:
             pos = metal_coord + d_ideal * ideal_dir
-            vacant_positions.append(pos)
+            positions.append(pos)
 
-    # Limit to open_slots
-    return vacant_positions[:hypothesis.open_slots]
+    # In metaldock mode, limit to the number of open coordination slots
+    if mode == "metaldock":
+        return positions[:hypothesis.open_slots]
+    return positions
+
+
+# Backward-compatible alias
+compute_vacant_coordination_sites = compute_coordination_dummy_positions
 
 
 def _generate_ideal_directions(cn: int, geometry: str) -> List[np.ndarray]:
@@ -173,20 +191,26 @@ def _generate_ideal_directions(cn: int, geometry: str) -> List[np.ndarray]:
 
 def inject_dummy_atoms_pdbqt(
     pdbqt_path: str,
-    vacant_positions: List[np.ndarray],
+    positions: List[np.ndarray],
     output_path: str,
+    atom_type: str = "HD",
 ) -> str:
     """
-    Inject dummy atoms at vacant coordination sites into receptor PDBQT.
+    Inject dummy atoms at coordination sites into receptor PDBQT.
 
-    The dummy atoms are typed as "HD" (hydrogen bond donor) which creates
-    an attractive potential for N/O/S acceptor atoms on the ligand.
-    This follows the MetalDock/AutoDock4Zn approach.
+    The dummy atoms guide the docking engine toward coordination geometry.
+    The atom type controls the interaction potential:
+
+    - ``"HD"`` (default, MetalDock mode): H-bond donor type, creates
+      attractive potential for N/O/S acceptor atoms on the ligand.
+    - ``"Zn"`` (AD4 mode): Zinc atom type, activates AutoDock4's
+      zinc-specific force field extensions (AutoDock4Zn).
 
     Args:
         pdbqt_path: path to original receptor PDBQT.
-        vacant_positions: 3D coordinates for dummy atoms.
+        positions: 3D coordinates for dummy atoms.
         output_path: path to write modified PDBQT.
+        atom_type: PDBQT atom type for dummy atoms.
 
     Returns:
         Path to the modified PDBQT file.
@@ -210,15 +234,15 @@ def inject_dummy_atoms_pdbqt(
 
     # Build dummy atom PDBQT lines
     dummy_lines = []
-    for j, pos in enumerate(vacant_positions):
+    for j, pos in enumerate(positions):
         serial = last_serial + j + 1
         x, y, z = pos
-        # PDBQT format: HETATM with atom type "HD" (H-bond donor)
-        # This makes Vina's H-bond scoring term attractive for N/O/S
+        # PDBQT format: HETATM with configurable atom type
+        # HD = H-bond donor (MetalDock); Zn = zinc (AD4Zn)
         line = (
             f"HETATM{serial:5d}  DU  DUM Z{j+1:4d}    "
             f"{x:8.3f}{y:8.3f}{z:8.3f}"
-            f"  1.00  0.00           HD\n"
+            f"  1.00  0.00    {atom_type:>10s}\n"
         )
         dummy_lines.append(line)
 
@@ -241,6 +265,9 @@ class VinaEngine:
     toward the metal.
     """
 
+    # Metals for which AD4 scoring (with AutoDock4Zn extensions) is preferred
+    _AD4_METALS = {"ZN"}
+
     def __init__(
         self,
         exhaustiveness: int = 32,
@@ -249,6 +276,7 @@ class VinaEngine:
         seed: int = 42,
         cpu: int = 0,
         use_dummy_atoms: bool = True,
+        prefer_ad4_for_zinc: bool = True,
     ) -> None:
         self.exhaustiveness = exhaustiveness
         self.num_modes = num_modes
@@ -256,6 +284,28 @@ class VinaEngine:
         self.seed = seed
         self.cpu = cpu
         self.use_dummy_atoms = use_dummy_atoms
+        self.prefer_ad4_for_zinc = prefer_ad4_for_zinc
+
+    def _select_scoring(self, hypothesis: Optional[CoordinationHypothesis]) -> str:
+        """
+        Select scoring function based on metal type.
+
+        Vina 1.2.x supports --scoring ad4 which gives access to the
+        AutoDock4 force field with zinc-specific extensions (AutoDock4Zn).
+        This is significantly better for zinc metalloproteins.
+        """
+        if (self.prefer_ad4_for_zinc
+                and hypothesis is not None
+                and hypothesis.metal_symbol in self._AD4_METALS):
+            try:
+                from vina import Vina
+                # Test if AD4 scoring is available
+                v_test = Vina(sf_name="ad4", cpu=1)
+                del v_test
+                return "ad4"
+            except Exception:
+                pass
+        return "vina"
 
     def dock(
         self,
@@ -269,6 +319,7 @@ class VinaEngine:
         If a hypothesis is provided, the box is centered on the metal site
         and dummy atoms are injected at vacant coordination sites to guide
         ligand donors toward the metal (MetalDock/AutoDock4Zn approach).
+        For zinc targets, prefers AD4 scoring when available (Vina 1.2.x).
         """
         from vina import Vina
 
@@ -277,20 +328,29 @@ class VinaEngine:
         if not ligand.pdbqt_string or not ligand.pdbqt_string.strip():
             raise RuntimeError("Ligand PDBQT not available.")
 
-        # Inject dummy atoms at coordination vacancies if hypothesis given
+        # Select scoring function (AD4 for zinc if available)
+        sf_name = self._select_scoring(hypothesis)
+
+        # Inject dummy atoms at coordination sites if hypothesis given
         receptor_pdbqt = receptor.pdbqt_path
         _tmpdir = None
         if hypothesis is not None and self.use_dummy_atoms:
-            vacant = compute_vacant_coordination_sites(hypothesis)
-            if vacant:
+            # AD4 scoring uses all-positions mode; Vina uses vacant-only
+            dummy_mode = "ad4zn" if sf_name == "ad4" else "metaldock"
+            dummy_atom_type = "Zn" if sf_name == "ad4" else "HD"
+            dummy_positions = compute_coordination_dummy_positions(
+                hypothesis, mode=dummy_mode)
+            if dummy_positions:
                 _tmpdir = tempfile.mkdtemp(prefix="vina_dummy_")
                 modified_path = os.path.join(_tmpdir, "receptor_dummy.pdbqt")
                 receptor_pdbqt = inject_dummy_atoms_pdbqt(
-                    receptor.pdbqt_path, vacant, modified_path)
-                log.info("  Injected %d dummy atoms at coordination vacancies",
-                         len(vacant))
+                    receptor.pdbqt_path, dummy_positions, modified_path,
+                    atom_type=dummy_atom_type)
+                log.info("  Injected %d dummy atoms (mode=%s, type=%s, "
+                         "scoring=%s)", len(dummy_positions), dummy_mode,
+                         dummy_atom_type, sf_name)
 
-        v = Vina(sf_name="vina", cpu=self.cpu, seed=self.seed)
+        v = Vina(sf_name=sf_name, cpu=self.cpu, seed=self.seed)
         v.set_receptor(receptor_pdbqt)
         v.set_ligand_from_string(ligand.pdbqt_string)
 
