@@ -256,8 +256,8 @@ class ReceptorPreparator:
             basename = os.path.splitext(os.path.basename(pdbqt_path))[0]
             abs_pdb = os.path.abspath(pdb_path)
             result = subprocess.run(
-                [mk_prep, "--read_pdb", abs_pdb,
-                 "-o", basename, "-p", "--allow_bad_res"],
+                [mk_prep, "-i", abs_pdb,
+                 "-o", basename, "--allow_bad_res"],
                 capture_output=True, text=True, timeout=300,
                 cwd=out_dir,
             )
@@ -265,9 +265,13 @@ class ReceptorPreparator:
                 expected = os.path.join(out_dir, f"{basename}.pdbqt")
                 if os.path.exists(expected) and expected != pdbqt_path:
                     shutil.move(expected, pdbqt_path)
-                return
-            log.warning("mk_prepare_receptor failed: %s",
-                        result.stderr.strip()[:500])
+                if os.path.isfile(pdbqt_path) and os.path.getsize(pdbqt_path) > 0:
+                    return
+                log.warning("mk_prepare_receptor returned 0 but no output "
+                            "file found; falling back to obabel.")
+            else:
+                log.warning("mk_prepare_receptor failed: %s",
+                            result.stderr.strip()[:500])
 
         # Fallback: obabel
         result = subprocess.run(

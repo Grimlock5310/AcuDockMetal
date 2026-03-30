@@ -351,10 +351,6 @@ class VinaEngine:
                          "scoring=%s)", len(dummy_positions), dummy_mode,
                          dummy_atom_type, sf_name)
 
-        v = Vina(sf_name=sf_name, cpu=self.cpu, seed=self.seed)
-        v.set_receptor(receptor_pdbqt)
-        v.set_ligand_from_string(ligand.pdbqt_string)
-
         # Box: center on metal site if hypothesis given
         center = receptor.box_center.tolist()
         size = (receptor.box_size * 2).tolist()  # Vina wants full widths
@@ -362,7 +358,28 @@ class VinaEngine:
         if hypothesis is not None:
             center = hypothesis.metal_site.coord.tolist()
 
-        v.compute_vina_maps(center=center, box_size=size)
+        # Try selected scoring function; fall back to standard vina if AD4 fails
+        v = None
+        for attempt_sf in ([sf_name, "vina"] if sf_name == "ad4" else [sf_name]):
+            try:
+                v = Vina(sf_name=attempt_sf, cpu=self.cpu, seed=self.seed)
+                v.set_receptor(receptor_pdbqt)
+                v.set_ligand_from_string(ligand.pdbqt_string)
+                v.compute_vina_maps(center=center, box_size=size)
+                sf_name = attempt_sf
+                break
+            except Exception as e:
+                if attempt_sf == "ad4":
+                    log.warning("  AD4 scoring failed (%s); retrying with "
+                                "standard vina scoring.", e)
+                    v = None
+                else:
+                    raise
+
+        if v is None:
+            raise RuntimeError("Could not initialise Vina with any scoring "
+                               "function.")
+
         log.info("  Starting Vina docking (exhaustiveness=%d, n_poses=%d, "
                  "scoring=%s)...", self.exhaustiveness, self.num_modes, sf_name)
         t0 = time.monotonic()
